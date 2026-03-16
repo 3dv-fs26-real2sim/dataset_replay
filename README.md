@@ -2,7 +2,7 @@
 
 ## Setup
 
-Create a conda environment and install the dependencies. What I prefer to do is install Isaac Sim and all dependencies into a single conda environment. If you have a different installation method for Isaac Sim, you would need to link it somehow. 
+Create a conda environment and install the dependencies. What I prefer to do is install Isaac Sim and all dependencies into a single conda environment. If you have a different installation method for Isaac Sim, you would need to link it somehow. For the dependencies in requirements.txt, I may have missed some out -- please add any additional dependencies needed, and install new dependencies as you go when you run into errors. 
 
 ```bash
 # Create and activate conda environment
@@ -13,7 +13,7 @@ conda activate 3dv
 pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
 
 # Install other dependencies
-# I don't have an explicit dependencies list but if you guys I can make one. For now, I would say look for "missing module" error and install whatever appears. 
+pip install -r requirements.txt
 ```
 
 Download h5 files from Euler cluster. I chose object_in_bowl_processed_50hz/20250804_104715.h5 bag_groceries/20250829_180500.h5 as they were the smallest files. You can try other files too. 
