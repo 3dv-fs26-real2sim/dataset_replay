@@ -20,18 +20,18 @@ Download h5 files from Euler cluster. I chose object_in_bowl_processed_50hz/2025
 
 ```bash
 # Copy with scp
-scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/object_in_bowl_processed_50hz/20250804_104715.h5 .
+scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/object_in_bowl_processed_50hz/20250804_104715.h5 data/
 
-scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/bag_groceries/20250829_180500.h5 .
+scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/bag_groceries/20250829_180500.h5 data/
 ```
 
 Now run the replay file. **Make sure that the h5 file paths and USD file paths are correct.**
 
 ```bash
 # Run the replay script
-python franka_orca_replay.py
+python scripts/test_replay.py
 ```
 
 ## Inspection of Dataset
 
-You can inspect the h5 files with `inspect_h5.ipynb`. Feel free to modify or add any scripts. You should choose the kernel to be the conda environment you created.
+You can inspect the h5 files with `notebooks/inspect_h5.ipynb`. Feel free to modify or add any scripts. You should choose the kernel to be the conda environment you created.
