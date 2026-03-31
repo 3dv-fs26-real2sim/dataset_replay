@@ -80,15 +80,15 @@
   <li><strong>Parse CLI arguments</strong> &mdash; before anything else, because Isaac Sim's <code>SimulationApp</code> needs <code>--headless</code> at construction time.</li>
   <li><strong>Create <code>SimulationApp</code></strong> &mdash; this boots the Omniverse runtime. All Isaac Sim / Omni imports must come <em>after</em> this point (they depend on the runtime being initialized).</li>
   <li><strong>Load h5 data</strong> &mdash; read arm wrist poses and hand joint angles from the HDF5 file.</li>
-  <li><strong>Detect quaternion ordering</strong> &mdash; auto-detect whether the h5 quaternions are wxyz or xyzw, reorder to wxyz if needed.</li>
+  <li><strong>Detect quaternion ordering</strong> &mdash; auto-detect whether the h5 quaternions are wxyz or xyzw and reorder to wxyz if needed. The IK solver requires wxyz (scalar-first).</li>
   <li><strong>Open USD stage</strong> &mdash; load the pre-built scene containing the robot(s) and environment.</li>
-  <li><strong>Create World and articulations</strong> &mdash; Isaac Sim's physics world, with one or two <code>SingleArticulation</code> objects wrapping the robot prims.</li>
+  <li><strong>Create World and articulations</strong> &mdash; Isaac Sim's physics world, with one or two <code>SingleArticulation</code> objects wrapping the robot prims. If <code>--no-collision</code> is set, collision is disabled on the table (<code>/World/Cube</code>).</li>
   <li><strong>Create IK solvers</strong> &mdash; one per arm side (different URDFs for left/right because the EE frames are in the hand portion).</li>
-  <li><strong>Compute initial arm pose via IK</strong> &mdash; solve for joint angles that achieve <code>INITIAL_WRIST_POSITION</code> + <code>INITIAL_WRIST_ROTATION</code>.</li>
+  <li><strong>Compute home arm pose via IK</strong> &mdash; solve for joint angles that achieve <code>WRIST_HOME_POSITION</code> + <code>WRIST_HOME_ROTATION</code>.</li>
   <li><strong>Resolve DOF indices</strong> &mdash; map canonical joint names (e.g. <code>panda_joint1</code>) to the articulation's internal DOF array indices.</li>
-  <li><strong>Set initial joint positions</strong> &mdash; write the IK-computed arm joints and zero hand joints to the articulation.</li>
+  <li><strong>Set home joint positions</strong> &mdash; write the IK-computed arm joints and zero hand joints to the articulation.</li>
   <li><strong>Create position setters</strong> &mdash; closures that, per frame, solve IK for the arm and set all joint positions.</li>
-  <li><strong>Hold initial pose</strong> &mdash; render the initial pose for a few seconds so the viewer can see it.</li>
+  <li><strong>Hold home pose</strong> &mdash; render the home pose for a few seconds so the viewer can see it.</li>
   <li><strong>Replay loop</strong> &mdash; for each frame, call the position setter with the h5 wrist pose and hand joints, step physics, optionally capture video.</li>
   <li><strong>Report and cleanup</strong> &mdash; print IK failure stats, close video writer, close SimulationApp.</li>
 </ol>
@@ -136,9 +136,10 @@ FRANKA_RIGHT_PATH = "/World/fer_orcahand_right_extended"</code></pre>
 <p>These are the USD prim paths where the robot articulations live inside the scene. They must exactly match the hierarchy in the USD file.</p>
 
 <h3>Data Dimensions (lines 74&ndash;75)</h3>
-<pre><code>N_ARM_POSE_DIMS = 7   # 3 position (xyz) + 4 quaternion
+<pre><code>N_ARM_POSE_DIMS = 7   # 3 position (xyz) + 4 quaternion (wxyz)
 N_HAND_DOFS     = 17</code></pre>
-<p>Used to validate h5 dataset shapes at load time. The arm data is <em>not</em> 7 joint angles &mdash; it is 7 pose components.</p>
+<p>Used to validate h5 dataset shapes at load time. The arm data is <em>not</em> 7 joint angles &mdash; it is 7 pose components
+(<code>[x, y, z, qw, qx, qy, qz]</code>).</p>
 
 <h3>Joint Name Lists (lines 78&ndash;96)</h3>
 <p><code>ARM_JOINT_NAMES</code>: <code>["panda_joint1", ..., "panda_joint7"]</code>. These are the canonical names used to look up arm DOF indices in the articulation. The <code>resolve_dof_indices()</code> function also tries <code>fer_joint*</code> as an alias.</p>
@@ -150,13 +151,13 @@ N_HAND_DOFS     = 17</code></pre>
 <p>The URDF link name that the IK solver targets. When you call <code>compute_inverse_kinematics(frame_name=...)</code>,
 the solver finds joint angles that place <em>this specific link's origin</em> at the target position and orientation.
 Changing this variable changes which physical point on the robot the IK aims for.</p>
-<p>Currently set to <code>"left_wrist_jointbody"</code> / <code>"right_wrist_jointbody"</code>.
-Other candidates include <code>"fer_link8"</code> (arm flange), <code>"connector_mount"</code>, <code>"right_palm"</code>, <code>"right_tower"</code>.</p>
+<p>Currently set to <code>"fer_link8"</code> (arm flange).
+Other candidates include <code>"left_wrist_jointbody"</code> / <code>"right_wrist_jointbody"</code>, <code>"connector_mount"</code>, <code>"right_palm"</code>, <code>"right_tower"</code>.</p>
 
 <div class="note">
-  <strong>Important:</strong> The <code>INITIAL_WRIST_ROTATION</code> describes the desired <em>world-frame orientation
+  <strong>Important:</strong> The <code>WRIST_HOME_ROTATION</code> describes the desired <em>world-frame orientation
   of the chosen EE frame</em>. Different EE frames have different local coordinate axes in the URDF, so if you
-  change the EE frame, you will likely also need to change <code>INITIAL_WRIST_ROTATION</code> to get the desired
+  change the EE frame, you will likely also need to change <code>WRIST_HOME_ROTATION</code> to get the desired
   physical pose. The IK solver correctly handles the full kinematic chain &mdash; it does not need any manual
   rotation offset. You just need to tell it what world-frame orientation you want <em>that particular link</em> to have.
 </div>
@@ -167,16 +168,16 @@ Other candidates include <code>"fer_link8"</code> (arm flange), <code>"connector
 different hand link names (<code>left_wrist_jointbody</code> vs <code>right_wrist_jointbody</code>).
 This means we create <strong>two separate solver instances</strong>, one per side.</p>
 
-<h4><code>INITIAL_WRIST_POSITION</code> / <code>INITIAL_WRIST_ROTATION</code></h4>
-<pre><code>INITIAL_WRIST_POSITION = [0.40, 0.0, 0.3]   # meters, in world frame
-INITIAL_WRIST_ROTATION = [[1,  0,  0],
-                          [0, -1,  0],
-                          [0,  0, -1]]</code></pre>
-<p>The target pose for the initial arm configuration, solved via IK at startup. The rotation matrix is built
+<h4><code>WRIST_HOME_POSITION</code> / <code>WRIST_HOME_ROTATION</code></h4>
+<pre><code>WRIST_HOME_POSITION = [0.40, 0.0, 0.3]   # meters, in world frame
+WRIST_HOME_ROTATION = [[1,  0,  0],
+                       [0, -1,  0],
+                       [0,  0, -1]]</code></pre>
+<p>The target pose for the home arm configuration, solved via IK at startup. The rotation matrix is built
 from the rule <code>x=[1,0,0], z=[0,0,-1]</code> with <code>y = z &times; x = [0,-1,0]</code>. This matrix
 is converted to a wxyz quaternion before being passed to the solver.</p>
 
-<h4><code>HAND_JOINT_VALUES_INITIAL</code></h4>
+<h4><code>HAND_HOME_JOINT_VALUES</code></h4>
 <p>All zeros. The hand starts fully open. Per-frame hand data is added as offsets to these values.</p>
 
 
@@ -187,12 +188,15 @@ is converted to a wxyz quaternion before being passed to the solver.</p>
 <p>Shape: <code>(n_frames, 7)</code> per arm. Each row: <code>[x, y, z, qw, qx, qy, qz]</code></p>
 <ul>
   <li><strong>Columns 0&ndash;2</strong>: wrist position in meters (xyz), in the arm's coordinate frame.</li>
-  <li><strong>Columns 3&ndash;6</strong>: wrist orientation as a unit quaternion. The ordering (wxyz vs xyzw) is auto-detected at runtime.</li>
+  <li><strong>Columns 3&ndash;6</strong>: wrist orientation as a unit quaternion. The ordering (wxyz vs xyzw) is auto-detected at runtime by <code>detect_quaternion_order()</code> and reordered to wxyz if needed.</li>
 </ul>
-<p>These are <strong>absolute</strong> poses, not offsets from initial. The script solves IK per frame to convert each pose to 7 joint angles.</p>
+<p>These are <strong>absolute</strong> poses in the robot's base frame. The quaternion uses a
+<strong>tool-frame convention</strong> where identity <code>[1,0,0,0]</code> means the hand is
+pointing straight down (see <a href="#quat-convention">Quaternion Convention</a> below).
+This is converted to the URDF frame convention before being passed to the IK solver.</p>
 
 <h3>Hand Data &mdash; Joint Angles</h3>
-<p>Shape: <code>(n_frames, 17)</code> per hand. Direct joint angles in radians. Applied as offsets from <code>HAND_JOINT_VALUES_INITIAL</code> (all zeros).</p>
+<p>Shape: <code>(n_frames, 17)</code> per hand. Direct joint angles in radians. Applied as offsets from <code>HAND_HOME_JOINT_VALUES</code> (all zeros).</p>
 
 <h3>Dataset Keys</h3>
 <table>
@@ -202,10 +206,64 @@ is converted to a wxyz quaternion before being passed to the solver.</p>
 </table>
 <p>By default the script reads <code>observations/qpos_*</code>. Pass <code>--use-actions</code> to read <code>actions_*</code> instead.</p>
 
-<h3>Quaternion Auto-Detection</h3>
-<p>The function <code>detect_quaternion_order()</code> checks whether the quaternion scalar part (w) is in column 3 (wxyz) or column 6 (xyzw).
-It compares the mean absolute value of those columns: for small rotations near identity, w is close to 1.0 and dominates the other components.
-If column 6 has a larger mean absolute value than column 3, the data is assumed to be xyzw and is reordered to wxyz in-place.</p>
+
+<!-- ======================================================================= -->
+<h2 id="quat-convention">Quaternion Convention: Tool Frame vs URDF Frame</h2>
+
+<p>The H5 wrist quaternions and the IK solver use <strong>different orientation conventions</strong>.
+Understanding this mismatch is critical to correct replay.</p>
+
+<h3>The two conventions</h3>
+<table>
+  <tr><th></th><th>Tool-frame convention (H5 data)</th><th>URDF convention (IK solver)</th></tr>
+  <tr>
+    <td>Identity quaternion <code>[1,0,0,0]</code> means</td>
+    <td>Hand pointing <strong>straight down</strong> (Z-tool toward table)</td>
+    <td>EE frame aligned with <strong>base frame</strong> (Z-up)</td>
+  </tr>
+  <tr>
+    <td>Hand straight down</td>
+    <td><code>[1, 0, 0, 0]</code></td>
+    <td><code>[0, 1, 0, 0]</code> &nbsp; (= Rx(180&deg;))</td>
+  </tr>
+</table>
+
+<h3>Why the 180&deg; offset exists</h3>
+<p>In the URDF kinematic chain, <code>fer_link8</code> (the Franka flange) inherits its
+Z-axis from the last joint axis. When all joints are at zero, this Z-axis points
+roughly upward (away from the table). A hand pointing straight down therefore
+requires a 180&deg; rotation around X to flip the frame upside-down: the rotation
+matrix <code>[[1,0,0],[0,-1,0],[0,0,-1]]</code>, or equivalently the quaternion
+<code>[0, 1, 0, 0]</code> (Rx(180&deg;) in wxyz).</p>
+
+<p>Robot teleoperation systems typically define the "neutral" tool pose as the
+gripper pointing downward &mdash; the most common working orientation. In this
+convention an identity quaternion already means "hand down", so small task
+deviations (tilting to pick an object, rotating to pour) are represented as small
+rotations near identity. The Egoverse dataset follows this convention.</p>
+
+<h3>The conversion</h3>
+<p>Before passing an H5 quaternion <code>q_h5</code> to the IK solver, we
+left-multiply by Rx(180&deg;):</p>
+<pre><code>Q_TOOL_TO_URDF = [0, 1, 0, 0]          # Rx(180&deg;) in wxyz
+q_urdf = quat_multiply(Q_TOOL_TO_URDF, q_h5)</code></pre>
+
+<p>This is implemented by <code>tool_quat_to_urdf()</code> and is applied inside
+<code>set_positions()</code> (the per-frame closure returned by
+<code>make_ik_position_setter()</code>).</p>
+
+<h3>Numerical example</h3>
+<p>Consider the H5 first frame for <code>arm_right</code>: <code>q_h5 &approx; [0.937, 0.268, 0, 0]</code>.</p>
+<ul>
+  <li><strong>Without conversion:</strong> the IK interprets this as Rx(41&deg;) &mdash; the hand is nearly horizontal, pointing forward. This is visually wrong.</li>
+  <li><strong>With Rx(180&deg;) pre-multiply:</strong> <code>[0,1,0,0] &times; [0.937,0.268,0,0] = [-0.268, 0.937, 0, 0]</code>, which is equivalent to Rx(149&deg;) &mdash; the hand is pointing down and tilted &sim;31&deg; toward the table. This matches the expected picking motion.</li>
+</ul>
+
+<div class="note">
+  <strong>The HOME pose is not affected.</strong> <code>WRIST_HOME_ROTATION</code> is defined
+  directly in URDF convention (Rx(180&deg;) = <code>[[1,0,0],[0,-1,0],[0,0,-1]]</code>),
+  so it bypasses the H5 conversion path entirely and goes straight to the IK solver.
+</div>
 
 
 <!-- ======================================================================= -->
@@ -324,12 +382,19 @@ Called twice in dual mode (once per side), once in single mode.</p>
 <p>Converts a 3&times;3 rotation matrix to a wxyz quaternion. Uses <code>scipy.spatial.transform.Rotation</code>
 which returns xyzw, then reorders to wxyz for the Lula solver.</p>
 
+<h3><code class="fn">quat_multiply</code>(q1, q2)</h3>
+<p>Hamilton quaternion product <code>q1 &times; q2</code>, both in wxyz convention.
+Used by <code>tool_quat_to_urdf()</code> to apply the Rx(180&deg;) convention offset.</p>
+
+<h3><code class="fn">tool_quat_to_urdf</code>(q_tool_wxyz)</h3>
+<p>Converts a quaternion from the H5 tool-frame convention (identity = hand down) to the
+URDF convention by left-multiplying with <code>Q_TOOL_TO_URDF = [0, 1, 0, 0]</code> (Rx(180&deg;)).
+See <a href="#quat-convention">Quaternion Convention</a> for a full explanation.</p>
+
 <h3><code class="fn">detect_quaternion_order</code>(arm_data, label)</h3>
 <p>Heuristic to determine whether h5 quaternion columns are wxyz or xyzw.
-Compares the mean absolute value of column 3 vs column 6. For rotations near identity, the scalar
-component w &asymp; 1.0 dominates, so whichever column has the higher mean is likely w.
-If xyzw is detected, the data is reordered in-place to wxyz. Also warns if the quaternion norm
-deviates from 1.0 (which would indicate the data isn't quaternions at all).</p>
+Compares the mean absolute value of column 3 vs column 6 &mdash; for rotations near identity, the scalar
+component w &asymp; 1.0 dominates. If xyzw is detected, the data is reordered to wxyz.</p>
 
 <h3><code class="fn">solve_ik_for_pose</code>(solver, ee_frame_name, position, orientation_wxyz, warm_start)</h3>
 <p>Thin wrapper around <code>solver.compute_inverse_kinematics()</code>. Returns <code>(joint_positions, success)</code>
@@ -367,7 +432,7 @@ Validates shapes against <code>N_ARM_POSE_DIMS</code> and <code>N_HAND_DOFS</cod
 Returns a dict with keys <code>"arm_left"</code>, <code>"arm_right"</code>, <code>"hand_left"</code>,
 <code>"hand_right"</code>, <code>"n_frames"</code>.</p>
 
-<h3><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_initial, initial_arm_joints)</h3>
+<h3><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_home, home_arm_joints)</h3>
 <p>This is the core function. It returns a <strong>closure</strong> (<code>set_positions</code>) that captures all the
 setup state and is called once per frame during replay.</p>
 <p>Internal state (captured in the closure):</p>
@@ -379,11 +444,11 @@ setup state and is called once per frame during replay.</p>
 </ul>
 <p>The returned <code>set_positions(wrist_pose, q_hand)</code> function:</p>
 <ol>
-  <li>Splits <code>wrist_pose</code> into position (xyz) and orientation (wxyz quaternion).</li>
+  <li>Splits <code>wrist_pose</code> into position (xyz) and orientation (wxyz quaternion), then converts the quaternion from tool-frame to URDF convention via <code>tool_quat_to_urdf()</code> (see <a href="#quat-convention">Quaternion Convention</a>).</li>
   <li>Calls <code>solve_ik_for_pose()</code> with the previous solution as warm-start.</li>
   <li>If IK succeeds: writes the new arm joints to <code>buf</code> and updates <code>prev_arm_joints</code>.</li>
   <li>If IK fails: increments the failure counter and reuses the previous solution (arm holds steady).</li>
-  <li>Writes <code>hand_initial + q_hand</code> to the hand DOF indices.</li>
+  <li>Writes <code>hand_home + q_hand</code> to the hand DOF indices.</li>
   <li>Calls <code>art.set_joint_positions(buf)</code> to apply everything to the articulation.</li>
 </ol>
 <p>A <code>get_ik_failure_count()</code> method is attached to the closure for reporting after replay.</p>
@@ -397,8 +462,8 @@ setup state and is called once per frame during replay.</p>
 <pre><code>data = load_h5(H5_PATH, args.use_actions, args.mode)
 data["arm_right"] = detect_quaternion_order(data["arm_right"], "arm_right")
 # ... same for arm_left if not None</code></pre>
-<p>After loading, the first frame is printed as a diagnostic so you can manually verify the data looks sane
-(position in meters, quaternion norm &asymp; 1.0).</p>
+<p>Loads arm wrist poses and hand joint angles from the h5 file. Quaternion ordering is auto-detected
+and reordered to wxyz if needed. The first frame is printed as a diagnostic.</p>
 
 <h3>Step 2: Open scene and create articulations</h3>
 <pre><code>omni.usd.get_context().open_stage(str(USD_PATH))
@@ -413,17 +478,17 @@ to their default state and must be called before reading or writing joint positi
 ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, "left")  # dual only</code></pre>
 <p>Two solver instances because the URDFs differ (left vs right hand link names).</p>
 
-<h3>Step 4: Compute initial arm joints</h3>
-<pre><code>initial_wrist_quat = rotation_matrix_to_wxyz(INITIAL_WRIST_ROTATION)
-initial_arm_joints, _ = solve_ik_for_pose(
+<h3>Step 4: Compute home arm joints</h3>
+<pre><code>home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
+home_arm_joints, _ = solve_ik_for_pose(
     ik_solver_right, EE_FRAME_NAME_RIGHT,
-    INITIAL_WRIST_POSITION, initial_wrist_quat,
+    WRIST_HOME_POSITION, home_wrist_quat,
 )</code></pre>
 <p>The rotation matrix is converted to a wxyz quaternion, then IK is solved for the right solver.
 The same arm joint result is used for both arms (the FER arm kinematics are identical; only the hand differs).
 If IK fails here, the script raises a <code>RuntimeError</code> with diagnostic info.</p>
 
-<h3>Step 5: Resolve DOF indices and set initial positions</h3>
+<h3>Step 5: Resolve DOF indices and set home positions</h3>
 <p>For each articulation, <code>resolve_dof_indices()</code> maps the canonical joint names to the articulation's
 internal DOF array. Then the IK-computed arm joints and zero hand joints are written directly.</p>
 
@@ -431,13 +496,13 @@ internal DOF array. Then the IK-computed arm joints and zero hand joints are wri
 <pre><code>set_right = make_ik_position_setter(
     franka_right, arm_idx_right, hand_idx_right,
     ik_solver_right, EE_FRAME_NAME_RIGHT,
-    HAND_JOINT_VALUES_INITIAL, initial_arm_joints,
+    HAND_HOME_JOINT_VALUES, home_arm_joints,
 )</code></pre>
 <p>These closures are the per-frame workhorses. Each one captures its own IK solver, DOF indices,
 and warm-start state.</p>
 
-<h3>Step 7: Initial hold</h3>
-<p>Runs <code>INITIAL_HOLD_SECONDS &times; fps</code> simulation steps with the initial pose, so the viewer
+<h3>Step 7: Home hold</h3>
+<p>Runs <code>HOME_HOLD_SECONDS &times; fps</code> simulation steps with the home pose, so the viewer
 can see the starting configuration before replay begins.</p>
 
 <h3>Step 8: Replay loop</h3>
@@ -479,10 +544,11 @@ This involves several internal functions:</p>
 <table>
   <tr><th>Argument</th><th>Default</th><th>Description</th></tr>
   <tr><td><code>--headless</code></td><td>off</td><td>Run without the GUI window. The Omniverse runtime still boots but does not create a visible window. Useful for batch processing or SSH.</td></tr>
-  <tr><td><code>--fps &lt;float&gt;</code></td><td>60.0</td><td>Controls the initial hold duration (<code>hold_frames = INITIAL_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
+  <tr><td><code>--fps &lt;float&gt;</code></td><td>60.0</td><td>Controls the home hold duration (<code>hold_frames = HOME_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
   <tr><td><code>--use-actions</code></td><td>off</td><td>Read from <code>actions_*</code> h5 keys instead of <code>observations/qpos_*</code>. The actions represent commanded poses; observations represent measured poses. Which one to use depends on your analysis goal.</td></tr>
   <tr><td><code>--mode {single,dual}</code></td><td>dual</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
   <tr><td><code>--record</code> / <code>--no-record</code></td><td>off</td><td>Enable/disable MP4 recording to <code>outputs/&lt;H5_STEM&gt;_replay.mp4</code>.</td></tr>
+  <tr><td><code>--no-collision</code></td><td>off</td><td>Disable collision between the robots and the table (<code>/World/Cube</code>). Useful when the replay trajectory passes through the table geometry.</td></tr>
 </table>
 
 
@@ -534,20 +600,20 @@ python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
 <!-- ======================================================================= -->
 <h2 id="troubleshooting">Troubleshooting</h2>
 
-<h3>IK fails for the initial pose</h3>
+<h3>IK fails for the home pose</h3>
 <div class="warn">
-  <code>RuntimeError: IK failed for initial wrist pose</code>
+  <code>RuntimeError: IK failed for home wrist pose</code>
 </div>
 <ul>
   <li>Check the printed "Available frames" list &mdash; your <code>EE_FRAME_NAME_*</code> must appear there.</li>
   <li>Verify the target pose is within the arm's workspace (roughly a 0.85m sphere around the base).</li>
   <li>Ensure <code>root_link</code> in the YAML matches the URDF's base link name (should be <code>base</code>).</li>
-  <li>If you changed <code>EE_FRAME_NAME</code>, you likely also need to change <code>INITIAL_WRIST_ROTATION</code> to match the new frame's local axes.</li>
+  <li>If you changed <code>EE_FRAME_NAME</code>, you likely also need to change <code>WRIST_HOME_ROTATION</code> to match the new frame's local axes.</li>
 </ul>
 
-<h3>Awkward/wrong initial pose</h3>
+<h3>Awkward/wrong home pose</h3>
 <ul>
-  <li><code>INITIAL_WRIST_ROTATION</code> describes the desired <em>world-frame orientation of the EE link</em>. Different links have different local axes. Use the IK solver's <code>compute_forward_kinematics()</code> to inspect what orientation a given frame has at a known joint config, then work backwards to determine the right rotation matrix for your desired physical pose.</li>
+  <li><code>WRIST_HOME_ROTATION</code> describes the desired <em>world-frame orientation of the EE link</em>. Different links have different local axes. Use the IK solver's <code>compute_forward_kinematics()</code> to inspect what orientation a given frame has at a known joint config, then work backwards to determine the right rotation matrix for your desired physical pose.</li>
 </ul>
 
 <h3>High IK failure rate during replay</h3>
@@ -555,12 +621,6 @@ python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
   <li>A few failures at extreme poses are normal. The arm holds its last valid configuration.</li>
   <li>Many failures may indicate the h5 poses are in a different coordinate frame than expected.</li>
   <li>Check quaternion norm in the diagnostic output &mdash; values far from 1.0 mean the data format is wrong.</li>
-</ul>
-
-<h3>Wrong quaternion ordering</h3>
-<ul>
-  <li>The auto-detection heuristic assumes the scalar part (w) has the largest mean absolute value. This works for most motion capture data where orientations stay near upright. It could fail for trajectories that spend most of their time near 180-degree rotations.</li>
-  <li>To force a specific ordering, edit <code>detect_quaternion_order()</code> or bypass it entirely.</li>
 </ul>
 
 <h3>Imports fail before SimulationApp</h3>

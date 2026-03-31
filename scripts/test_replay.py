@@ -29,6 +29,11 @@ parser.add_argument(
     default=False,
     help="Record replay video to outputs/H5NAME_replay.mp4 (default: False)",
 )
+parser.add_argument(
+    "--no-collision",
+    action="store_true",
+    help="Disable collision between robots and the table (/World/Cube)",
+)
 args = parser.parse_args()
 
 APP_WIDTH = 1280
@@ -97,8 +102,9 @@ HAND_RIGHT_JOINT_NAMES = [
 
 # --- IK Solver Configuration ---
 # End-effector frame names in the URDF kinematic tree.
-# Change these to target a different frame for testing.
-EE_FRAME_NAME_LEFT  = "fer_link8" 
+# fer_link8 is the Franka flange frame — matches the frame the H5 poses reference.
+# (fer_link8 has the same orientation as fer_link7 but is 0.107m further along Z.)
+EE_FRAME_NAME_LEFT  = "fer_link8"
 EE_FRAME_NAME_RIGHT = "fer_link8"
 
 # Paths for the Lula IK solver.
@@ -108,21 +114,21 @@ LULA_DESCRIPTOR_PATH = SCRIPT_DIR / "../../pandaorca_description/lula/fer_robot_
 URDF_PATH_LEFT  = SCRIPT_DIR / "../../pandaorca_description/urdf/fer_orcahand_left_extended.urdf"
 URDF_PATH_RIGHT = SCRIPT_DIR / "../../pandaorca_description/urdf/fer_orcahand_right_extended.urdf"
 
-# Initial wrist target pose for IK (replaces hardcoded joint angles).
+# Home wrist target pose for IK (replaces hardcoded joint angles).
 # In each arm's coordinate system:
 #   position  = [0.40, 0.0, 0.3]
 #   rotation  = x=[1,0,0], z=[0,0,-1]  →  R = [[1,0,0],[0,-1,0],[0,0,-1]]
-INITIAL_WRIST_POSITION = np.array([0.40, 0.0, 0.3])
-INITIAL_WRIST_ROTATION = np.array([
+WRIST_HOME_POSITION = np.array([0.40, 0.0, 0.3])
+WRIST_HOME_ROTATION = np.array([
     [1,  0,  0],
     [0, -1,  0],
     [0,  0, -1],
 ], dtype=float)
 
-HAND_JOINT_VALUES_INITIAL = np.array([0.0] * N_HAND_DOFS)
+HAND_HOME_JOINT_VALUES = np.array([0.0] * N_HAND_DOFS)
 
-# Show initial pose before replay starts.
-INITIAL_HOLD_SECONDS = 3.0
+# Show home pose before replay starts.
+HOME_HOLD_SECONDS = 3.0
 
 
 def create_ik_solver(urdf_path: Path, label: str) -> LulaKinematicsSolver:
@@ -142,42 +148,52 @@ def rotation_matrix_to_wxyz(rot_matrix: np.ndarray) -> np.ndarray:
     return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
+def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton quaternion product q1*q2, both in wxyz convention."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ])
+
+
+# H5 data uses a tool-frame convention where identity = hand pointing down.
+# The URDF fer_link7/8 frame has Rx(180°) when the hand points down.
+# Pre-multiply by Rx(180°) to convert from tool convention to URDF convention.
+Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])  # Rx(180°) in wxyz
+
+
+def tool_quat_to_urdf(q_tool_wxyz: np.ndarray) -> np.ndarray:
+    """Convert tool-convention quaternion (identity=down) to URDF convention."""
+    return quat_multiply(Q_TOOL_TO_URDF, q_tool_wxyz)
+
 
 def detect_quaternion_order(arm_data: np.ndarray, label: str) -> np.ndarray:
-    """Check whether columns 3:7 are wxyz or xyzw quaternions, reorder to wxyz if needed.
+    """Detect whether quaternion columns 3:7 are wxyz or xyzw, reorder to wxyz if needed.
 
-    Returns the (possibly reordered) arm data array.
+    Heuristic: for small rotations near identity, the scalar part w is close to 1.0
+    and dominates the other components. Whichever column (3 or 6) has the higher mean
+    absolute value is likely w.
     """
-    quat_wxyz = arm_data[:, 3:7]
-    norms_wxyz = np.linalg.norm(quat_wxyz, axis=1)
-    mean_norm_wxyz = np.mean(norms_wxyz)
-
-    # Both orderings have the same norm (they're the same 4 values), so norm alone
-    # can't distinguish them. Instead, check if w (scalar part) is typically the
-    # largest component — for small rotations from identity, w is close to 1.
-    # With wxyz: column 3 is w.  With xyzw: column 6 is w.
     w_if_wxyz = np.mean(np.abs(arm_data[:, 3]))
     w_if_xyzw = np.mean(np.abs(arm_data[:, 6]))
 
-    print(f"[quat] {label}: norm={mean_norm_wxyz:.4f}  "
-          f"mean|col3|={w_if_wxyz:.4f}  mean|col6|={w_if_xyzw:.4f}")
-
-    if abs(mean_norm_wxyz - 1.0) > 0.1:
-        print(f"[quat] WARNING: quaternion norm is {mean_norm_wxyz:.4f}, expected ~1.0. "
-              "The arm data may not be in the expected [xyz, quat] format.")
+    print(f"[quat] {label}: mean|col3|={w_if_wxyz:.4f}  mean|col6|={w_if_xyzw:.4f}")
 
     if w_if_xyzw > w_if_wxyz:
-        print(f"[quat] {label}: detected xyzw ordering (col6 looks like scalar part). "
-              "Reordering to wxyz.")
+        print(f"[quat] {label}: detected xyzw ordering. Reordering to wxyz.")
         reordered = arm_data.copy()
         reordered[:, 3] = arm_data[:, 6]  # w
         reordered[:, 4] = arm_data[:, 3]  # x
         reordered[:, 5] = arm_data[:, 4]  # y
         reordered[:, 6] = arm_data[:, 5]  # z
         return reordered
-    else:
-        print(f"[quat] {label}: appears to be wxyz ordering. Using as-is.")
-        return arm_data
+
+    print(f"[quat] {label}: appears to be wxyz ordering. Using as-is.")
+    return arm_data
 
 
 def solve_ik_for_pose(
@@ -349,8 +365,8 @@ def make_ik_position_setter(
     hand_idx: np.ndarray,
     ik_solver: LulaKinematicsSolver,
     ee_frame_name: str,
-    hand_initial: np.ndarray,
-    initial_arm_joints: np.ndarray,
+    hand_home: np.ndarray,
+    home_arm_joints: np.ndarray,
 ):
     """Return a callable that solves IK for each wrist pose and sets joint positions.
 
@@ -360,13 +376,13 @@ def make_ik_position_setter(
         hand_idx: DOF indices for the hand joints.
         ik_solver: Lula IK solver instance.
         ee_frame_name: target end-effector frame for IK.
-        hand_initial: Initial hand joint values (offsets are added to these).
-        initial_arm_joints: IK solution for the initial pose, used as first warm-start.
+        hand_home: Home hand joint values (offsets are added to these).
+        home_arm_joints: IK solution for the home pose, used as first warm-start.
     """
     base = art.get_joint_positions().copy()
     buf = base.copy()
     state = {
-        "prev_arm_joints": initial_arm_joints.copy(),
+        "prev_arm_joints": home_arm_joints.copy(),
         "ik_failures": 0,
     }
 
@@ -374,11 +390,13 @@ def make_ik_position_setter(
         """Set joint positions from a wrist pose and hand joint angles.
 
         Args:
-            wrist_pose: [x, y, z, qw, qx, qy, qz] — absolute wrist pose (wxyz quat).
-            q_hand: hand joint angle offsets (added to hand_initial).
+            wrist_pose: [x, y, z, qw, qx, qy, qz] — wrist pose in tool convention
+                        (identity=down). Quaternion is converted to URDF convention
+                        via Rx(180°) before IK.
+            q_hand: hand joint angle offsets (added to hand_home).
         """
         position = wrist_pose[:3]
-        orientation_wxyz = wrist_pose[3:]
+        orientation_wxyz = tool_quat_to_urdf(wrist_pose[3:])
 
         arm_joints, _ = solve_ik_for_pose(
             ik_solver, ee_frame_name, position, orientation_wxyz,
@@ -393,7 +411,7 @@ def make_ik_position_setter(
             state["ik_failures"] += 1
             buf[arm_idx] = state["prev_arm_joints"]
 
-        buf[hand_idx] = hand_initial + q_hand
+        buf[hand_idx] = hand_home + q_hand
         art.set_joint_positions(buf)
 
     def get_ik_failure_count() -> int:
@@ -687,7 +705,8 @@ def main():
     data = load_h5(H5_PATH, args.use_actions, args.mode)
     n_frames = data["n_frames"]
 
-    # Detect and fix quaternion ordering in arm data (ensure wxyz).
+    # H5 arm data format: [x, y, z, q0, q1, q2, q3] — quaternion order may be wxyz or xyzw.
+    # Auto-detect and reorder to wxyz (scalar-first) for the IK solver.
     data["arm_right"] = detect_quaternion_order(data["arm_right"], "arm_right")
     if data["arm_left"] is not None:
         data["arm_left"] = detect_quaternion_order(data["arm_left"], "arm_left")
@@ -709,24 +728,36 @@ def main():
         franka_left = setup_articulation(FRANKA_LEFT_PATH, world)
     world.reset()
 
+    # Disable collision between robots and the table (/World/Cube).
+    if args.no_collision:
+        from pxr import UsdPhysics
+        stage = omni.usd.get_context().get_stage()
+        table_prim = stage.GetPrimAtPath("/World/Cube")
+        if table_prim.IsValid():
+            collision_api = UsdPhysics.CollisionAPI(table_prim)
+            collision_api.GetCollisionEnabledAttr().Set(False)
+            print("[collision] Disabled collision on /World/Cube (table)")
+        else:
+            print("[collision] WARNING: /World/Cube not found in stage")
+
     # Create per-side IK solvers (different URDFs for left/right hand frames).
     ik_solver_right = create_ik_solver(URDF_PATH_RIGHT, "right")
     if args.mode == "dual":
         ik_solver_left = create_ik_solver(URDF_PATH_LEFT, "left")
 
-    # Compute initial arm joint values via IK.
-    initial_wrist_quat = rotation_matrix_to_wxyz(INITIAL_WRIST_ROTATION)
-    initial_arm_joints, _ = solve_ik_for_pose(
+    # Compute home arm joint values via IK.
+    home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
+    home_arm_joints, _ = solve_ik_for_pose(
         ik_solver_right, EE_FRAME_NAME_RIGHT,
-        INITIAL_WRIST_POSITION, initial_wrist_quat,
+        WRIST_HOME_POSITION, home_wrist_quat,
     )
-    if initial_arm_joints is None:
+    if home_arm_joints is None:
         raise RuntimeError(
-            f"IK failed for initial wrist pose "
-            f"(pos={INITIAL_WRIST_POSITION}, quat={initial_wrist_quat}). "
+            f"IK failed for home wrist pose "
+            f"(pos={WRIST_HOME_POSITION}, quat={home_wrist_quat}). "
             f"Check EE_FRAME_NAME_RIGHT='{EE_FRAME_NAME_RIGHT}' and the Lula descriptor."
         )
-    print(f"[IK] Initial arm joints (rad): {initial_arm_joints}")
+    print(f"[IK] Home arm joints (rad): {home_arm_joints}")
 
     print_dof_info("franka_right", franka_right)
     arm_idx_right = resolve_dof_indices(franka_right, ARM_JOINT_NAMES, "franka_right")
@@ -736,30 +767,30 @@ def main():
         arm_idx_left = resolve_dof_indices(franka_left, ARM_JOINT_NAMES, "franka_left")
         hand_idx_left = resolve_dof_indices(franka_left, HAND_LEFT_JOINT_NAMES, "franka_left")
 
-    # Set initial joint values through resolved DOF indices.
-    q_init_right = franka_right.get_joint_positions().copy()
-    q_init_right[arm_idx_right] = initial_arm_joints
-    q_init_right[hand_idx_right] = HAND_JOINT_VALUES_INITIAL
-    franka_right.set_joint_positions(q_init_right)
+    # Set home joint values through resolved DOF indices.
+    q_home_right = franka_right.get_joint_positions().copy()
+    q_home_right[arm_idx_right] = home_arm_joints
+    q_home_right[hand_idx_right] = HAND_HOME_JOINT_VALUES
+    franka_right.set_joint_positions(q_home_right)
     if args.mode == "dual":
-        q_init_left = franka_left.get_joint_positions().copy()
-        q_init_left[arm_idx_left] = initial_arm_joints
-        q_init_left[hand_idx_left] = HAND_JOINT_VALUES_INITIAL
-        franka_left.set_joint_positions(q_init_left)
+        q_home_left = franka_left.get_joint_positions().copy()
+        q_home_left[arm_idx_left] = home_arm_joints
+        q_home_left[hand_idx_left] = HAND_HOME_JOINT_VALUES
+        franka_left.set_joint_positions(q_home_left)
 
     set_right = make_ik_position_setter(
         franka_right, arm_idx_right, hand_idx_right,
         ik_solver_right, EE_FRAME_NAME_RIGHT,
-        HAND_JOINT_VALUES_INITIAL, initial_arm_joints,
+        HAND_HOME_JOINT_VALUES, home_arm_joints,
     )
     if args.mode == "dual":
         set_left = make_ik_position_setter(
             franka_left, arm_idx_left, hand_idx_left,
             ik_solver_left, EE_FRAME_NAME_LEFT,
-            HAND_JOINT_VALUES_INITIAL, initial_arm_joints,
+            HAND_HOME_JOINT_VALUES, home_arm_joints,
         )
 
-    hold_frames = max(1, int(round(INITIAL_HOLD_SECONDS * args.fps)))
+    hold_frames = max(1, int(round(HOME_HOLD_SECONDS * args.fps)))
     total_capture_frames = hold_frames + n_frames
     recorder, output_path = (None, None)
     if args.record:
@@ -768,7 +799,7 @@ def main():
         print("[capture] Recording disabled by --no-record")
     captured_frames = 0
 
-    print(f"[replay] Holding initial pose for {INITIAL_HOLD_SECONDS:.1f}s ({hold_frames} frames)")
+    print(f"[replay] Holding home pose for {HOME_HOLD_SECONDS:.1f}s ({hold_frames} frames)")
     for _ in range(hold_frames):
         if not simulation_app.is_running():
             close_recorder(recorder)
