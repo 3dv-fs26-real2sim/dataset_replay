@@ -7,7 +7,7 @@ from isaacsim import SimulationApp
 
 parser = argparse.ArgumentParser(description="Spawn an object on the pandaorca scene")
 parser.add_argument("--headless", action="store_true", help="Run without GUI")
-parser.add_argument("--fps", type=float, default=60.0, help="Simulation frame rate (default: 60)")
+parser.add_argument("--fps", type=float, default=50.0, help="Simulation frame rate (default: 50.0)")
 parser.add_argument(
 	"--mode",
 	type=str,
