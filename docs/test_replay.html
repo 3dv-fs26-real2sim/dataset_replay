@@ -96,22 +96,29 @@
 
 <!-- ======================================================================= -->
 <h2 id="import-structure">Import Structure</h2>
-<p>The imports are split into two groups, separated by <code>SimulationApp</code> construction:</p>
+<p>The script is organized into a thin orchestration layer (<code>test_replay.py</code>) that imports
+reusable utilities from <code>scripts/utils/</code>. Imports are split into two groups,
+separated by <code>SimulationApp</code> construction:</p>
 
-<h3>Before SimulationApp (lines 1&ndash;8)</h3>
-<p>Only standard library modules and <code>from isaacsim import SimulationApp</code>. The <code>SimulationApp</code>
-import is lightweight &mdash; it just loads the launcher, not the full runtime.</p>
+<h3>Before SimulationApp</h3>
+<p>Only <code>argparse</code> and the lightweight <code>utils.app</code> module (which imports
+<code>isaacsim.SimulationApp</code> &mdash; just the launcher, not the full runtime):</p>
+<pre><code>from utils.app import add_common_args, create_app, resolve_usd_path, resolve_h5_path</code></pre>
 
-<h3>After SimulationApp (lines 46&ndash;54)</h3>
-<p>Everything that depends on the Omniverse runtime:</p>
+<h3>After SimulationApp</h3>
+<p>Everything that depends on the Omniverse runtime, imported from <code>utils/</code> modules:</p>
 <ul>
-  <li><code>numpy</code>, <code>h5py</code>, <code>imageio</code> &mdash; data handling</li>
-  <li><code>omni</code>, <code>omni.usd</code> &mdash; USD stage management</li>
-  <li><code>scipy.spatial.transform.Rotation</code> &mdash; quaternion/rotation conversions</li>
-  <li><code>isaacsim.core.api.World</code> &mdash; physics world</li>
-  <li><code>isaacsim.core.prims.SingleArticulation</code> &mdash; robot articulation wrapper</li>
-  <li><code>isaacsim.robot_motion.motion_generation.lula.kinematics.LulaKinematicsSolver</code> &mdash; the IK solver</li>
+  <li><code>utils.constants</code> &mdash; all shared constants (paths, joint names, home poses, IK config)</li>
+  <li><code>utils.rotation</code> &mdash; quaternion math (<code>rotation_matrix_to_wxyz</code>, <code>detect_quaternion_order</code>, <code>tool_quat_to_urdf</code>)</li>
+  <li><code>utils.h5_loader</code> &mdash; HDF5 trajectory loading</li>
+  <li><code>utils.robot</code> &mdash; articulation setup, DOF resolution, collision control</li>
+  <li><code>utils.ik</code> &mdash; IK solver creation, solving, position-setter factory</li>
+  <li><code>utils.capture</code> &mdash; viewport video capture pipeline</li>
 </ul>
+<p>Modules without Isaac Sim dependencies (<code>constants</code>, <code>rotation</code>,
+<code>h5_loader</code>) are safe to import at any time. Modules with Isaac Sim dependencies
+(<code>robot</code>, <code>ik</code>, <code>capture</code>, <code>object</code>) must be
+imported after <code>create_app()</code> returns.</p>
 <div class="warn">
   If you import <code>omni.*</code> or <code>isaacsim.core.*</code> before constructing <code>SimulationApp</code>,
   the import will fail with a cryptic error. This is an Isaac Sim requirement.
@@ -120,32 +127,33 @@ import is lightweight &mdash; it just loads the launcher, not the full runtime.<
 
 <!-- ======================================================================= -->
 <h2 id="constants">Constants &amp; Configuration</h2>
-<p>All configurable values are at the top of the script (lines 56&ndash;125). Here is what each one does:</p>
+<p>All configurable values live in <code>utils/constants.py</code>, the single source of truth for the project.
+All file paths are anchored to <code>PROJECT_ROOT = Path(__file__).resolve().parents[2]</code> (the <code>dataset_replay/</code> directory).</p>
 
-<h3>Path Selection (lines 56&ndash;67)</h3>
-<p>Based on <code>--mode</code>, the script selects:</p>
+<h3>Path Selection</h3>
+<p>Based on <code>--mode</code>, <code>utils.app.resolve_usd_path()</code> and <code>resolve_h5_path()</code> select:</p>
 <table>
   <tr><th></th><th><code>single</code></th><th><code>dual</code></th></tr>
   <tr><td>USD scene</td><td><code>pandaorca_single.usd</code></td><td><code>pandaorca_dual.usd</code></td></tr>
   <tr><td>H5 file</td><td><code>20250804_104715.h5</code> (1199 frames)</td><td><code>20250829_180500.h5</code> (1928 frames)</td></tr>
 </table>
 
-<h3>Prim Paths (lines 70&ndash;71)</h3>
+<h3>Prim Paths</h3>
 <pre><code>FRANKA_LEFT_PATH  = "/World/fer_orcahand_left_extended"
 FRANKA_RIGHT_PATH = "/World/fer_orcahand_right_extended"</code></pre>
 <p>These are the USD prim paths where the robot articulations live inside the scene. They must exactly match the hierarchy in the USD file.</p>
 
-<h3>Data Dimensions (lines 74&ndash;75)</h3>
+<h3>Data Dimensions</h3>
 <pre><code>N_ARM_POSE_DIMS = 7   # 3 position (xyz) + 4 quaternion (wxyz)
 N_HAND_DOFS     = 17</code></pre>
 <p>Used to validate h5 dataset shapes at load time. The arm data is <em>not</em> 7 joint angles &mdash; it is 7 pose components
 (<code>[x, y, z, qw, qx, qy, qz]</code>).</p>
 
-<h3>Joint Name Lists (lines 78&ndash;96)</h3>
-<p><code>ARM_JOINT_NAMES</code>: <code>["panda_joint1", ..., "panda_joint7"]</code>. These are the canonical names used to look up arm DOF indices in the articulation. The <code>resolve_dof_indices()</code> function also tries <code>fer_joint*</code> as an alias.</p>
+<h3>Joint Name Lists</h3>
+<p><code>ARM_JOINT_NAMES</code>: <code>["panda_joint1", ..., "panda_joint7"]</code>. These are the canonical names used to look up arm DOF indices in the articulation. The <code>utils.robot.resolve_dof_indices()</code> function also tries <code>fer_joint*</code> as an alias.</p>
 <p><code>HAND_LEFT_JOINT_NAMES</code> / <code>HAND_RIGHT_JOINT_NAMES</code>: the 17 OrcaHand joints in order. The first is the wrist revolute joint, followed by 4 thumb joints and 3 joints each for index/middle/ring/pinky (abd + mcp + pip).</p>
 
-<h3>IK Solver Configuration (lines 98&ndash;120)</h3>
+<h3>IK Solver Configuration</h3>
 
 <h4><code>EE_FRAME_NAME_LEFT</code> / <code>EE_FRAME_NAME_RIGHT</code></h4>
 <p>The URDF link name that the IK solver targets. When you call <code>compute_inverse_kinematics(frame_name=...)</code>,
@@ -372,43 +380,44 @@ which matches the URDF and the h5 data. If your stage uses centimeters, the solv
 
 <!-- ======================================================================= -->
 <h2 id="functions">Function-by-Function Reference</h2>
+<p>Functions are organized into utility modules under <code>scripts/utils/</code>. Each heading shows the module and function name.</p>
 
-<h3><code class="fn">create_ik_solver</code>(urdf_path, label)</h3>
-<p>Constructs a <code>LulaKinematicsSolver</code> from the shared descriptor YAML and the given URDF.
+<h3><code>utils.ik.</code><code class="fn">create_ik_solver</code>(urdf_path, descriptor_path, label)</h3>
+<p>Constructs a <code>LulaKinematicsSolver</code> from a descriptor YAML and URDF.
 Prints the active joints and all available frames (useful for choosing <code>EE_FRAME_NAME</code>).
 Called twice in dual mode (once per side), once in single mode.</p>
 
-<h3><code class="fn">rotation_matrix_to_wxyz</code>(rot_matrix)</h3>
+<h3><code>utils.rotation.</code><code class="fn">rotation_matrix_to_wxyz</code>(rot_matrix)</h3>
 <p>Converts a 3&times;3 rotation matrix to a wxyz quaternion. Uses <code>scipy.spatial.transform.Rotation</code>
 which returns xyzw, then reorders to wxyz for the Lula solver.</p>
 
-<h3><code class="fn">quat_multiply</code>(q1, q2)</h3>
+<h3><code>utils.rotation.</code><code class="fn">quat_multiply</code>(q1, q2)</h3>
 <p>Hamilton quaternion product <code>q1 &times; q2</code>, both in wxyz convention.
 Used by <code>tool_quat_to_urdf()</code> to apply the Rx(180&deg;) convention offset.</p>
 
-<h3><code class="fn">tool_quat_to_urdf</code>(q_tool_wxyz)</h3>
+<h3><code>utils.rotation.</code><code class="fn">tool_quat_to_urdf</code>(q_tool_wxyz)</h3>
 <p>Converts a quaternion from the H5 tool-frame convention (identity = hand down) to the
 URDF convention by left-multiplying with <code>Q_TOOL_TO_URDF = [0, 1, 0, 0]</code> (Rx(180&deg;)).
 See <a href="#quat-convention">Quaternion Convention</a> for a full explanation.</p>
 
-<h3><code class="fn">detect_quaternion_order</code>(arm_data, label)</h3>
+<h3><code>utils.rotation.</code><code class="fn">detect_quaternion_order</code>(arm_data, label)</h3>
 <p>Heuristic to determine whether h5 quaternion columns are wxyz or xyzw.
 Compares the mean absolute value of column 3 vs column 6 &mdash; for rotations near identity, the scalar
 component w &asymp; 1.0 dominates. If xyzw is detected, the data is reordered to wxyz.</p>
 
-<h3><code class="fn">solve_ik_for_pose</code>(solver, ee_frame_name, position, orientation_wxyz, warm_start)</h3>
+<h3><code>utils.ik.</code><code class="fn">solve_ik_for_pose</code>(solver, ee_frame_name, position, orientation_wxyz, warm_start)</h3>
 <p>Thin wrapper around <code>solver.compute_inverse_kinematics()</code>. Returns <code>(joint_positions, success)</code>
 where <code>joint_positions</code> is <code>None</code> if the solver did not converge.</p>
 
-<h3><code class="fn">setup_articulation</code>(prim_path, world)</h3>
+<h3><code>utils.robot.</code><code class="fn">setup_articulation</code>(prim_path, world)</h3>
 <p>Creates a <code>SingleArticulation</code> from a USD prim path, generates a unique name from the path
 (replacing <code>/</code> with <code>_</code>), and adds it to the physics world's scene. Returns the articulation object.</p>
 
-<h3><code class="fn">print_dof_info</code>(label, art)</h3>
+<h3><code>utils.robot.</code><code class="fn">print_dof_info</code>(label, art)</h3>
 <p>Debug helper that prints all DOF names and indices for an articulation. Useful for verifying that the
 URDF/USD loaded correctly and that joint names match expectations.</p>
 
-<h3><code class="fn">resolve_dof_indices</code>(art, names, label)</h3>
+<h3><code>utils.robot.</code><code class="fn">resolve_dof_indices</code>(art, names, label)</h3>
 <p>Maps a list of canonical joint names to the articulation's internal DOF array indices. This is necessary
 because the articulation's DOF order may not match the order in our name lists. The function tries three
 matching strategies in order:</p>
@@ -421,18 +430,18 @@ matching strategies in order:</p>
 </ol>
 <p>Returns a numpy array of integer indices that can be used to slice into <code>art.get_joint_positions()</code>.</p>
 
-<h3><code class="fn">_read_dataset</code>(f, candidates, required)</h3>
-<p>Tries each key in <code>candidates</code> against the h5 file. Returns the first match as a numpy array.
-If <code>required=True</code> and nothing matches, raises <code>KeyError</code>.</p>
+<h3><code>utils.robot.</code><code class="fn">set_collision_enabled</code>(stage, prim_path, enabled)</h3>
+<p>Enables or disables collision on a USD prim. Used by <code>test_replay.py</code> with <code>--no-collision</code>
+to disable the table collision.</p>
 
-<h3><code class="fn">load_h5</code>(path, use_actions, mode)</h3>
+<h3><code>utils.h5_loader.</code><code class="fn">load_h5</code>(path, use_actions, mode)</h3>
 <p>Loads all arm and hand datasets from the h5 file. In dual mode, loads left and right separately.
 In single mode, tries right-specific keys first, then falls back to generic keys (e.g. <code>actions_arm</code>).
 Validates shapes against <code>N_ARM_POSE_DIMS</code> and <code>N_HAND_DOFS</code>.
 Returns a dict with keys <code>"arm_left"</code>, <code>"arm_right"</code>, <code>"hand_left"</code>,
 <code>"hand_right"</code>, <code>"n_frames"</code>.</p>
 
-<h3><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_home, home_arm_joints)</h3>
+<h3><code>utils.ik.</code><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_home, home_arm_joints)</h3>
 <p>This is the core function. It returns a <strong>closure</strong> (<code>set_positions</code>) that captures all the
 setup state and is called once per frame during replay.</p>
 <p>Internal state (captured in the closure):</p>
@@ -456,10 +465,10 @@ setup state and is called once per frame during replay.</p>
 
 <!-- ======================================================================= -->
 <h2 id="main-function">The main() Function</h2>
-<p>Detailed walkthrough of <code>main()</code> (starting at line 686):</p>
+<p>Detailed walkthrough of <code>main()</code> in <code>test_replay.py</code>:</p>
 
 <h3>Step 1: Load and validate data</h3>
-<pre><code>data = load_h5(H5_PATH, args.use_actions, args.mode)
+<pre><code>data = load_h5(h5_path, args.use_actions, args.mode)
 data["arm_right"] = detect_quaternion_order(data["arm_right"], "arm_right")
 # ... same for arm_left if not None</code></pre>
 <p>Loads arm wrist poses and hand joint angles from the h5 file. Quaternion ordering is auto-detected
@@ -474,8 +483,8 @@ world.reset()</code></pre>
 to their default state and must be called before reading or writing joint positions.</p>
 
 <h3>Step 3: Create IK solvers</h3>
-<pre><code>ik_solver_right = create_ik_solver(URDF_PATH_RIGHT, "right")
-ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, "left")  # dual only</code></pre>
+<pre><code>ik_solver_right = create_ik_solver(URDF_PATH_RIGHT, LULA_DESCRIPTOR_PATH, "right")
+ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, LULA_DESCRIPTOR_PATH, "left")  # dual only</code></pre>
 <p>Two solver instances because the URDFs differ (left vs right hand link names).</p>
 
 <h3>Step 4: Compute home arm joints</h3>
@@ -537,13 +546,17 @@ down the Omniverse runtime.</p>
 <!-- ======================================================================= -->
 <h2 id="video-capture">Video Capture System</h2>
 <p>When <code>--record</code> is passed, the script captures viewport frames to an MP4 via <code>imageio</code>.
-This involves several internal functions:</p>
+All capture logic lives in <code>utils/capture.py</code>. Key functions:</p>
 <ul>
-  <li><code>setup_capture()</code> &mdash; creates the imageio writer and gets the active viewport.</li>
-  <li><code>capture_frame_to_writer()</code> &mdash; uses <code>capture_viewport_to_buffer()</code> with a callback
-      that receives the raw pixel data. The callback goes through multiple decode strategies because
+  <li><code>setup_capture(total_frames, output_path, fps, width, height)</code> &mdash; creates the imageio writer and gets the active viewport. All parameters are passed explicitly (no module-level globals).</li>
+  <li><code>capture_frame_to_writer(recorder, simulation_app)</code> &mdash; uses <code>capture_viewport_to_buffer()</code> with a callback
+      that receives the raw pixel data. The <code>simulation_app</code> is passed explicitly. The callback goes through multiple decode strategies because
       different Kit/Isaac Sim versions provide the data in different formats (numpy array, memoryview,
       raw pointer, PyCapsule).</li>
+  <li><code>close_recorder(recorder)</code> &mdash; closes the video writer.</li>
+</ul>
+<p>Internal helpers in the same module:</p>
+<ul>
   <li><code>_buffer_to_numpy_1d()</code> &mdash; converts various buffer types to a flat uint8 numpy array,
       including handling raw C pointers via <code>ctypes</code>.</li>
   <li><code>_decode_raw_with_dims()</code> &mdash; reshapes a flat buffer into an HxWx3 image given known dimensions.</li>
@@ -559,7 +572,7 @@ This involves several internal functions:</p>
 <table>
   <tr><th>Argument</th><th>Default</th><th>Description</th></tr>
   <tr><td><code>--headless</code></td><td>off</td><td>Run without the GUI window. The Omniverse runtime still boots but does not create a visible window. Useful for batch processing or SSH.</td></tr>
-  <tr><td><code>--fps &lt;float&gt;</code></td><td>60.0</td><td>Controls the home hold duration (<code>hold_frames = HOME_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
+  <tr><td><code>--fps &lt;float&gt;</code></td><td>50.0</td><td>Controls the home hold duration (<code>hold_frames = HOME_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
   <tr><td><code>--use-actions</code></td><td>off</td><td>Read from <code>actions_*</code> h5 keys instead of <code>observations/qpos_*</code>. The actions represent commanded poses; observations represent measured poses. Which one to use depends on your analysis goal.</td></tr>
   <tr><td><code>--mode {single,dual}</code></td><td>dual</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
   <tr><td><code>--record</code> / <code>--no-record</code></td><td>off</td><td>Enable/disable MP4 recording to <code>outputs/&lt;H5_STEM&gt;_replay.mp4</code>.</td></tr>
@@ -607,7 +620,7 @@ python dataset_replay/scripts/test_replay.py --use-actions
 python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
 
 <h3>Regenerating the Lula Descriptor</h3>
-<pre><code>python dataset_replay/scripts/generate_lula_description.py \
+<pre><code>python dataset_replay/scripts/utils/generate_lula_description.py \
   --urdf pandaorca_description/urdf/fer.urdf \
   --output pandaorca_description/lula/fer_robot_descriptor.yaml</code></pre>
 
@@ -648,11 +661,24 @@ python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
 <h2 id="files">File Structure</h2>
 <pre><code>dataset_replay/
   scripts/
+    test_setup.py                 # Minimal robot init + sim loop
     test_replay.py                # Main replay script (documented here)
-    generate_lula_description.py  # Utility to regenerate the Lula YAML
+    test_object_spawn.py          # Spawn objects on the table with physics
+    utils/
+      __init__.py                 # Convenience re-exports (safe before SimulationApp)
+      constants.py                # All shared constants (paths, joint names, home poses)
+      app.py                      # SimulationApp creation + shared argparse flags
+      robot.py                    # Articulation setup, DOF resolution, collision control
+      rotation.py                 # Quaternion math (pure numpy/scipy)
+      ik.py                       # IK solver creation, solving, position-setter factory
+      h5_loader.py                # HDF5 trajectory loading
+      capture.py                  # Viewport video capture pipeline
+      object.py                   # Object spawning + physics (collision, gravity)
+      generate_lula_description.py  # Utility to regenerate the Lula YAML
   data/
     20250804_104715.h5            # Single arm dataset (1199 frames)
     20250829_180500.h5            # Dual arm dataset (1928 frames)
+  objects/                        # 3D object meshes (ball, duck, fish, grape, shovel)
   docs/
     test_replay.html              # This file
   outputs/                        # Generated videos (created automatically)
