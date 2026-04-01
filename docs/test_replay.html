@@ -483,10 +483,18 @@ ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, "left")  # dual only</code></
 home_arm_joints, _ = solve_ik_for_pose(
     ik_solver_right, EE_FRAME_NAME_RIGHT,
     WRIST_HOME_POSITION, home_wrist_quat,
+)
+# In dual mode, a separate home IK is computed for the left arm:
+home_arm_joints_left, _ = solve_ik_for_pose(
+    ik_solver_left, EE_FRAME_NAME_LEFT,
+    WRIST_HOME_POSITION, home_wrist_quat,
 )</code></pre>
 <p>The rotation matrix is converted to a wxyz quaternion, then IK is solved for the right solver.
-The same arm joint result is used for both arms (the FER arm kinematics are identical; only the hand differs).
-If IK fails here, the script raises a <code>RuntimeError</code> with diagnostic info.</p>
+In dual mode, a <strong>separate</strong> home IK is also computed for the left arm using its own
+solver (<code>ik_solver_left</code>). Each arm&rsquo;s home solution is used as the initial warm
+start for its respective IK closure, ensuring the warm-start chain begins in the correct
+configuration for each arm.
+If either IK fails, the script raises a <code>RuntimeError</code> with diagnostic info.</p>
 
 <h3>Step 5: Resolve DOF indices and set home positions</h3>
 <p>For each articulation, <code>resolve_dof_indices()</code> maps the canonical joint names to the articulation's
@@ -497,9 +505,16 @@ internal DOF array. Then the IK-computed arm joints and zero hand joints are wri
     franka_right, arm_idx_right, hand_idx_right,
     ik_solver_right, EE_FRAME_NAME_RIGHT,
     HAND_HOME_JOINT_VALUES, home_arm_joints,
+)
+# In dual mode, the left arm uses its own home IK solution:
+set_left = make_ik_position_setter(
+    franka_left, arm_idx_left, hand_idx_left,
+    ik_solver_left, EE_FRAME_NAME_LEFT,
+    HAND_HOME_JOINT_VALUES, home_arm_joints_left,
 )</code></pre>
 <p>These closures are the per-frame workhorses. Each one captures its own IK solver, DOF indices,
-and warm-start state.</p>
+and warm-start state. The <code>home_arm_joints</code> / <code>home_arm_joints_left</code> argument
+initializes the warm-start chain for each arm independently.</p>
 
 <h3>Step 7: Home hold</h3>
 <p>Runs <code>HOME_HOLD_SECONDS &times; fps</code> simulation steps with the home pose, so the viewer

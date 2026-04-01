@@ -757,7 +757,20 @@ def main():
             f"(pos={WRIST_HOME_POSITION}, quat={home_wrist_quat}). "
             f"Check EE_FRAME_NAME_RIGHT='{EE_FRAME_NAME_RIGHT}' and the Lula descriptor."
         )
-    print(f"[IK] Home arm joints (rad): {home_arm_joints}")
+    print(f"[IK] Home arm joints RIGHT (rad): {home_arm_joints}")
+
+    if args.mode == "dual":
+        home_arm_joints_left, _ = solve_ik_for_pose(
+            ik_solver_left, EE_FRAME_NAME_LEFT,
+            WRIST_HOME_POSITION, home_wrist_quat,
+        )
+        if home_arm_joints_left is None:
+            raise RuntimeError(
+                f"IK failed for left arm home wrist pose "
+                f"(pos={WRIST_HOME_POSITION}, quat={home_wrist_quat}). "
+                f"Check EE_FRAME_NAME_LEFT='{EE_FRAME_NAME_LEFT}' and the Lula descriptor."
+            )
+        print(f"[IK] Home arm joints LEFT  (rad): {home_arm_joints_left}")
 
     print_dof_info("franka_right", franka_right)
     arm_idx_right = resolve_dof_indices(franka_right, ARM_JOINT_NAMES, "franka_right")
@@ -774,7 +787,7 @@ def main():
     franka_right.set_joint_positions(q_home_right)
     if args.mode == "dual":
         q_home_left = franka_left.get_joint_positions().copy()
-        q_home_left[arm_idx_left] = home_arm_joints
+        q_home_left[arm_idx_left] = home_arm_joints_left
         q_home_left[hand_idx_left] = HAND_HOME_JOINT_VALUES
         franka_left.set_joint_positions(q_home_left)
 
@@ -787,7 +800,7 @@ def main():
         set_left = make_ik_position_setter(
             franka_left, arm_idx_left, hand_idx_left,
             ik_solver_left, EE_FRAME_NAME_LEFT,
-            HAND_HOME_JOINT_VALUES, home_arm_joints,
+            HAND_HOME_JOINT_VALUES, home_arm_joints_left,
         )
 
     hold_frames = max(1, int(round(HOME_HOLD_SECONDS * args.fps)))
