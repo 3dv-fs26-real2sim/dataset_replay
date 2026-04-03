@@ -16,8 +16,8 @@ parser.add_argument(
     help="Spawn position in meters (default: 0 0 1.0; table-top center)",
 )
 parser.add_argument(
-    "--scale", type=float, default=1.0,
-    help="Uniform object scale factor (default: 1.0)",
+    "--scale", type=float, default=0.1,
+    help="Uniform object scale factor (default: 0.1). Due to Artec export scale.",
 )
 args = parser.parse_args()
 
