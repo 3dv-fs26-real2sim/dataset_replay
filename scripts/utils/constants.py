@@ -143,3 +143,12 @@ CAMERA_CONFIGS = {
     },
     # "oakd": { "extrinsics": OAKD_EXTRINSICS, "intrinsics": OAKD_INTRINSICS },
 }
+
+# ── H5 image datasets ──────────────────────────────────────────────────────
+# Maps user-facing camera names to H5 dataset paths for image extraction.
+H5_IMAGE_PATHS = {
+    "aria": "observations/images/aria_rgb_cam/color",
+    "oakd": "observations/images/oakd_front_view/color",
+}
+
+H5_DEFAULT_CAMERA = "aria"

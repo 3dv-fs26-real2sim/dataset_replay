@@ -8,7 +8,45 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .constants import N_ARM_POSE_DIMS, N_HAND_DOFS
+from .constants import N_ARM_POSE_DIMS, N_HAND_DOFS, H5_IMAGE_PATHS
+
+
+def get_available_cameras(path: Path) -> dict[str, tuple[int, ...]]:
+    """Return {camera_name: shape} for image datasets found in the H5 file."""
+    result = {}
+    with h5py.File(path, "r") as f:
+        for name, ds_path in H5_IMAGE_PATHS.items():
+            if ds_path in f:
+                result[name] = f[ds_path].shape
+    return result
+
+
+def get_h5_image_dims(path: Path, camera_name: str) -> tuple[int, int] | tuple[None, None]:
+    """Return (width, height) for a camera's images in the H5 file, or (None, None)."""
+    ds_path = H5_IMAGE_PATHS.get(camera_name)
+    if ds_path is None:
+        return None, None
+    with h5py.File(path, "r") as f:
+        if ds_path not in f:
+            return None, None
+        shape = f[ds_path].shape  # (N, H, W, C)
+        return shape[2], shape[1]
+
+
+def open_h5_images(path: Path, camera_name: str):
+    """Open H5 file and return (file_handle, dataset) for random frame access.
+
+    Returns (None, None) if the camera dataset doesn't exist.
+    The caller is responsible for closing the returned file handle.
+    """
+    ds_path = H5_IMAGE_PATHS.get(camera_name)
+    if ds_path is None:
+        return None, None
+    f = h5py.File(path, "r")
+    if ds_path not in f:
+        f.close()
+        return None, None
+    return f, f[ds_path]
 
 
 def _read_dataset(f: h5py.File, candidates: list[str], required: bool = True):

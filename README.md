@@ -28,8 +28,20 @@ scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/bag
 Now run the replay file. **Make sure that the h5 file paths and USD file paths are correct.**
 
 ```bash
-# Run the replay script
+# Run the replay script (dual arm, default)
 python scripts/test_replay.py
+
+# Record Isaac Sim viewport → outputs/20250829_180500_replay_qpos.mp4
+python scripts/test_replay.py --record-sim
+
+# Record with Aria camera viewpoint
+python scripts/test_replay.py --camera aria --record-sim
+
+# Side-by-side comparison (Isaac Sim + H5 original)
+python scripts/test_replay.py --camera aria --record-comparison
+
+# Extract original H5 camera video (no GPU needed)
+python scripts/record_h5.py
 ```
 
 ## Inspection of Dataset
@@ -43,6 +55,7 @@ scripts/
 ├── test_setup.py              # Minimal robot init — load scene, set home pose, run sim loop
 ├── test_replay.py             # Replay H5 trajectories with IK solving + optional video recording
 ├── test_object_spawn.py       # Spawn objects on the table with physics
+├── record_h5.py               # Extract H5 camera images to MP4 (no GPU needed)
 └── utils/
     ├── __init__.py            # Convenience re-exports (safe before SimulationApp)
     ├── constants.py           # All shared constants (paths, joint names, home poses, etc.)
@@ -61,8 +74,9 @@ scripts/
 | Script | Description |
 |---|---|
 | `test_setup.py` | Loads a USD scene, creates robot articulations, sets home joint values, and runs the simulation loop. Use this to verify the scene loads correctly. |
-| `test_replay.py` | The main script. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. Supports `--record` for video, `--no-collision` to disable table collision, `--camera aria` to view from the calibrated Aria camera. See `docs/test_replay.html` for detailed documentation. |
+| `test_replay.py` | The main script. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. Supports `--record-sim` for video, `--record-comparison` for side-by-side (sim + H5 original), `--no-collision` to disable table collision, `--camera aria` to view from the calibrated Aria camera. Output filenames include a suffix like `qpos`, `actions_nocol` reflecting the active flags. See `docs/test_replay.html` for detailed documentation. |
 | `test_object_spawn.py` | Spawns a selected object (ball, duck, fish, grape, shovel) onto the table with rigid body physics. Use `--object`, `--position`, `--scale` to configure. |
+| `record_h5.py` | Standalone script to extract original camera images from H5 files to MP4. No Isaac Sim or GPU required. Supports `--h5-camera` (`aria`, `oakd`), `--mode`, `--fps`, `--h5-path`. |
 
 ### Utility Modules (`scripts/utils/`)
 
@@ -73,9 +87,9 @@ scripts/
 | `robot.py` | Yes (deferred) | `setup_articulation()` creates a robot from a USD prim. `resolve_dof_indices()` maps joint names to DOF indices with alias and suffix fallback. `set_collision_enabled()` toggles collision on any prim. |
 | `rotation.py` | No | Pure quaternion math: `rotation_matrix_to_wxyz()`, `quat_multiply()`, `tool_quat_to_urdf()` (H5 tool-frame → URDF convention via Rx(180°)), `detect_quaternion_order()` (auto-detect wxyz vs xyzw). |
 | `ik.py` | Yes (deferred) | `create_ik_solver()` builds a Lula IK solver from URDF + descriptor. `solve_ik_for_pose()` solves IK for a target pose. `make_ik_position_setter()` returns a per-frame closure with warm-start tracking. |
-| `h5_loader.py` | No | `load_h5()` loads arm wrist poses and hand joint angles from HDF5 files. Supports both `observations/qpos_*` and `actions_*` key schemas, single and dual arm modes. |
+| `h5_loader.py` | No | `load_h5()` loads arm wrist poses and hand joint angles from HDF5 files. Supports both `observations/qpos_*` and `actions_*` key schemas, single and dual arm modes. Also provides `get_available_cameras()`, `get_h5_image_dims()`, and `open_h5_images()` for H5 image data access. |
 | `camera.py` | Yes (deferred) | Camera setup from real-world calibration. Computes camera world pose from extrinsics + robot base transforms, creates a USD camera prim with intrinsics, and sets it as the active viewport. Supports Aria Gen 1 (extensible to OAK-D). |
-| `capture.py` | Yes (deferred) | `setup_capture()` / `capture_frame_to_writer()` / `close_recorder()` handle viewport-to-MP4 recording via imageio. Handles multiple Kit buffer formats (numpy, memoryview, raw pointer, PyCapsule). |
+| `capture.py` | Yes (deferred) | Video capture pipeline: `setup_capture()` / `capture_frame_to_writer()` / `close_recorder()` for sim viewport recording (with deferred encoding for speed), `export_h5_video()` for H5 image extraction, and `setup_sidebyside()` / `capture_sidebyside_frame()` / `close_sidebyside()` for side-by-side comparison videos. |
 | `object.py` | Yes (deferred) | `spawn_object()` loads an OBJ mesh into the scene and enables rigid body physics with convex hull collision. |
 
 **Import ordering note:** Modules marked "Yes (deferred)" import Isaac Sim types and must be imported by scripts *after* `create_app()` returns. Modules marked "No" are safe to import at any time.

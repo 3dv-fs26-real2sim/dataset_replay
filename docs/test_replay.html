@@ -50,6 +50,8 @@
   <li><a href="#functions">Function-by-Function Reference</a></li>
   <li><a href="#main-function">The main() Function</a></li>
   <li><a href="#video-capture">Video Capture System</a></li>
+  <li><a href="#h5-video">H5 Video Export</a></li>
+  <li><a href="#comparison">Side-by-Side Comparison</a></li>
   <li><a href="#cli-args">Command-Line Arguments</a></li>
   <li><a href="#running">Running the Script</a></li>
   <li><a href="#troubleshooting">Troubleshooting</a></li>
@@ -627,26 +629,97 @@ down the Omniverse runtime.</p>
 
 <!-- ======================================================================= -->
 <h2 id="video-capture">Video Capture System</h2>
-<p>When <code>--record</code> is passed, the script captures viewport frames to an MP4 via <code>imageio</code>.
-All capture logic lives in <code>utils/capture.py</code>. Key functions:</p>
+<p>The replay script (<code>test_replay.py</code>) supports two recording modes.
+A separate standalone script (<code>record_h5.py</code>) handles H5 image extraction without Isaac Sim.
+All capture logic lives in <code>utils/capture.py</code>.</p>
+
+<table>
+  <tr><th>Script / Flag</th><th>Output</th><th>Description</th></tr>
+  <tr><td><code>test_replay.py --record-sim</code></td><td><code>&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code></td><td>Record the Isaac Sim viewport to MP4.</td></tr>
+  <tr><td><code>test_replay.py --record-comparison</code></td><td><code>&lt;H5_STEM&gt;_comparison_&lt;SUFFIX&gt;.mp4</code></td><td>Side-by-side: Isaac Sim (left) + H5 original (right).</td></tr>
+  <tr><td><code>record_h5.py</code></td><td><code>&lt;H5_STEM&gt;_&lt;CAMERA&gt;.mp4</code></td><td>Extract original camera images from H5 to MP4 (no GPU needed).</td></tr>
+</table>
+
+<h3>Video Naming Convention</h3>
+<p>Output filenames include a descriptive suffix built from the active flags:</p>
 <ul>
-  <li><code>setup_capture(total_frames, output_path, fps, width, height)</code> &mdash; creates the imageio writer and gets the active viewport. All parameters are passed explicitly (no module-level globals).</li>
+  <li><code>&lt;H5_STEM&gt;_replay_qpos.mp4</code> &mdash; default (observations/qpos data, collision enabled)</li>
+  <li><code>&lt;H5_STEM&gt;_replay_actions.mp4</code> &mdash; <code>--use-actions</code></li>
+  <li><code>&lt;H5_STEM&gt;_replay_qpos_nocol.mp4</code> &mdash; <code>--no-collision</code></li>
+  <li><code>&lt;H5_STEM&gt;_replay_actions_nocol.mp4</code> &mdash; <code>--use-actions --no-collision</code></li>
+  <li><code>&lt;H5_STEM&gt;_comparison_qpos.mp4</code> &mdash; side-by-side with defaults</li>
+</ul>
+
+<h3>Deferred Encoding (Fast Record)</h3>
+<p>By default, viewport frames are buffered in memory during the replay loop and encoded
+to H.264 in a single batch after the loop finishes. This <strong>deferred encoding</strong> approach
+removes per-frame encoding overhead from the physics loop, making replay significantly
+faster when recording.</p>
+<p>Memory usage: ~1.8 GB for 1928 frames at 640&times;480. On low-memory machines, pass
+<code>--no-fast-record</code> to fall back to inline per-frame encoding (slower but low memory).</p>
+
+<h3>Sim Viewport Capture Functions</h3>
+<ul>
+  <li><code>setup_capture(total_frames, output_path, fps, width, height, deferred=True)</code> &mdash; creates the imageio writer and gets the active viewport. The <code>deferred</code> parameter controls buffering vs inline encoding.</li>
   <li><code>capture_frame_to_writer(recorder, simulation_app)</code> &mdash; uses <code>capture_viewport_to_buffer()</code> with a callback
-      that receives the raw pixel data. The <code>simulation_app</code> is passed explicitly. The callback goes through multiple decode strategies because
-      different Kit/Isaac Sim versions provide the data in different formats (numpy array, memoryview,
-      raw pointer, PyCapsule).</li>
-  <li><code>close_recorder(recorder)</code> &mdash; closes the video writer.</li>
+      that receives the raw pixel data. When deferred, the frame is appended to <code>recorder["frames"]</code> instead of being encoded immediately. Always stores the latest frame in <code>recorder["last_frame"]</code> for side-by-side access.</li>
+  <li><code>close_recorder(recorder)</code> &mdash; encodes any deferred frames, then closes the video writer.</li>
 </ul>
-<p>Internal helpers in the same module:</p>
+
+<h3>Resolution</h3>
+<p>The Isaac Sim viewport resolution defaults to the H5 image dimensions for the selected
+<code>--h5-camera</code> (640&times;480 for <code>aria</code>). This ensures the sim output matches the H5 video
+dimensions by default.  Override with <code>--sim-resolution WxH</code>.</p>
+
+
+<!-- ======================================================================= -->
+<h2 id="h5-video">H5 Video Export (<code>record_h5.py</code>)</h2>
+<p>The H5 files contain original RGB camera images that can be extracted to MP4 using the
+standalone <code>record_h5.py</code> script. This script does <strong>not</strong> require Isaac Sim or a GPU &mdash;
+it only reads H5 data and encodes to MP4 via imageio.</p>
+
+<h3>Usage</h3>
+<pre><code># Default: dual-arm aria camera
+python dataset_replay/scripts/record_h5.py
+
+# Single arm
+python dataset_replay/scripts/record_h5.py --mode single
+
+# OAK-D camera (dual only)
+python dataset_replay/scripts/record_h5.py --h5-camera oakd
+
+# Custom H5 file
+python dataset_replay/scripts/record_h5.py --h5-path path/to/file.h5
+
+# Custom frame rate
+python dataset_replay/scripts/record_h5.py --fps 30</code></pre>
+
+<h3>Available Cameras</h3>
+<table>
+  <tr><th>Name</th><th>H5 Dataset Path</th><th>Resolution</th><th>Available In</th></tr>
+  <tr><td><code>aria</code></td><td><code>observations/images/aria_rgb_cam/color</code></td><td>640&times;480</td><td>Both single and dual</td></tr>
+  <tr><td><code>oakd</code></td><td><code>observations/images/oakd_front_view/color</code></td><td>960&times;540</td><td>Dual only</td></tr>
+</table>
+<p>The camera-to-dataset mapping is defined in <code>H5_IMAGE_PATHS</code> in <code>constants.py</code>.
+Output is saved to <code>outputs/&lt;H5_STEM&gt;_&lt;CAMERA&gt;.mp4</code>.</p>
+
+
+<!-- ======================================================================= -->
+<h2 id="comparison">Side-by-Side Comparison</h2>
+<p><code>--record-comparison</code> produces a video with the Isaac Sim render on the left and the
+original H5 camera image on the right, concatenated horizontally. This implicitly enables
+viewport capture (no need to also pass <code>--record-sim</code>).</p>
+<p>Since the default sim resolution matches the H5 image dimensions, both halves are the
+same size and are concatenated directly. If <code>--sim-resolution</code> overrides the sim
+resolution, frames are resized to the same height via bilinear interpolation before
+concatenation.</p>
+<p>Key functions in <code>capture.py</code>:</p>
 <ul>
-  <li><code>_buffer_to_numpy_1d()</code> &mdash; converts various buffer types to a flat uint8 numpy array,
-      including handling raw C pointers via <code>ctypes</code>.</li>
-  <li><code>_decode_raw_with_dims()</code> &mdash; reshapes a flat buffer into an HxWx3 image given known dimensions.</li>
-  <li><code>_wait_capture_completion()</code> &mdash; handles both sync and async capture APIs.</li>
+  <li><code>setup_sidebyside()</code> &mdash; opens the H5 image dataset and creates a combined-resolution writer.</li>
+  <li><code>capture_sidebyside_frame(recorder, sim_frame, frame_idx)</code> &mdash; reads the H5 frame, optionally resizes, concatenates, and buffers.</li>
+  <li><code>close_sidebyside(recorder)</code> &mdash; encodes deferred frames and closes the writer + H5 file.</li>
 </ul>
-<div class="warn">
-  Recording works but is slow &mdash; each frame requires a GPU readback and encode step.
-</div>
+<p>During hold frames (home pose), the first H5 image is used as a frozen placeholder.</p>
 
 
 <!-- ======================================================================= -->
@@ -657,9 +730,13 @@ All capture logic lives in <code>utils/capture.py</code>. Key functions:</p>
   <tr><td><code>--fps &lt;float&gt;</code></td><td>50.0</td><td>Controls the home hold duration (<code>hold_frames = HOME_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
   <tr><td><code>--use-actions</code></td><td>off</td><td>Read from <code>actions_*</code> h5 keys instead of <code>observations/qpos_*</code>. The actions represent commanded poses; observations represent measured poses. Which one to use depends on your analysis goal.</td></tr>
   <tr><td><code>--mode {single,dual}</code></td><td>dual</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
-  <tr><td><code>--record</code> / <code>--no-record</code></td><td>off</td><td>Enable/disable MP4 recording to <code>outputs/&lt;H5_STEM&gt;_replay.mp4</code>.</td></tr>
   <tr><td><code>--no-collision</code></td><td>off</td><td>Disable collision between the robots and the table (<code>/World/Cube</code>). Useful when the replay trajectory passes through the table geometry.</td></tr>
-  <tr><td><code>--camera {aria}</code></td><td>None</td><td>Set the viewport to a calibrated real-world camera. Uses extrinsics from <code>constants.py</code> to position the camera relative to the robot arm bases. When omitted, the default Isaac Sim viewport is used. See <a href="#camera-setup">Camera Setup</a>.</td></tr>
+  <tr><td><code>--camera {aria,aria_half}</code></td><td>None</td><td>Set the viewport to a calibrated real-world camera. Uses extrinsics from <code>constants.py</code> to position the camera relative to the robot arm bases. When omitted, the default Isaac Sim viewport is used. See <a href="#camera-setup">Camera Setup</a>.</td></tr>
+  <tr><td><code>--record-sim</code></td><td>off</td><td>Record Isaac Sim viewport to <code>outputs/&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code>. Suffix encodes flags (e.g. <code>qpos</code>, <code>actions_nocol</code>).</td></tr>
+  <tr><td><code>--record-comparison</code></td><td>off</td><td>Record side-by-side comparison (Isaac Sim left, H5 original right) to <code>outputs/&lt;H5_STEM&gt;_comparison_&lt;SUFFIX&gt;.mp4</code>.</td></tr>
+  <tr><td><code>--h5-camera {aria,oakd}</code></td><td>aria</td><td>Which H5 camera to use for <code>--record-comparison</code>. Also determines the default sim resolution.</td></tr>
+  <tr><td><code>--no-fast-record</code></td><td>off</td><td>Disable deferred encoding. Slower recording but uses less memory.</td></tr>
+  <tr><td><code>--sim-resolution WxH</code></td><td>from H5</td><td>Override Isaac Sim render resolution. Default: match H5 image dimensions (e.g. 640x480 for aria).</td></tr>
 </table>
 
 
@@ -693,20 +770,33 @@ python dataset_replay/scripts/test_replay.py
 # Single arm, headless (no window)
 python dataset_replay/scripts/test_replay.py --mode single --headless
 
-# Dual arm with video recording
-python dataset_replay/scripts/test_replay.py --record
+# Record Isaac Sim viewport  →  outputs/20250829_180500_replay_qpos.mp4
+python dataset_replay/scripts/test_replay.py --record-sim
 
-# Use action data instead of observation data
-python dataset_replay/scripts/test_replay.py --use-actions
+# Record with Aria camera viewpoint
+python dataset_replay/scripts/test_replay.py --camera aria --record-sim
+
+# Record with actions + no collision  →  outputs/..._replay_actions_nocol.mp4
+python dataset_replay/scripts/test_replay.py --record-sim --use-actions --no-collision
+
+# Side-by-side comparison (Isaac Sim + H5 original)
+python dataset_replay/scripts/test_replay.py --camera aria --record-comparison
+
+# Both sim replay and comparison at once
+python dataset_replay/scripts/test_replay.py --camera aria --record-sim --record-comparison
+
+# Low-memory recording (inline encoding)
+python dataset_replay/scripts/test_replay.py --record-sim --no-fast-record
+
+# Custom sim resolution
+python dataset_replay/scripts/test_replay.py --record-comparison --sim-resolution 960x720
+
+# Extract H5 camera video (standalone, no GPU needed)
+python dataset_replay/scripts/record_h5.py
+python dataset_replay/scripts/record_h5.py --h5-camera oakd
 
 # Custom frame rate
-python dataset_replay/scripts/test_replay.py --fps 30
-
-# View from calibrated Aria camera
-python dataset_replay/scripts/test_replay.py --camera aria
-
-# Aria camera with recording
-python dataset_replay/scripts/test_replay.py --camera aria --record</code></pre>
+python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
 
 <h3>Regenerating the Lula Descriptor</h3>
 <pre><code>python dataset_replay/scripts/utils/generate_lula_description.py \
@@ -753,6 +843,7 @@ python dataset_replay/scripts/test_replay.py --camera aria --record</code></pre>
     test_setup.py                 # Minimal robot init + sim loop
     test_replay.py                # Main replay script (documented here)
     test_object_spawn.py          # Spawn objects on the table with physics
+    record_h5.py                  # Extract H5 camera images to MP4 (no GPU)
     utils/
       __init__.py                 # Convenience re-exports (safe before SimulationApp)
       constants.py                # All shared constants (paths, joint names, home poses)
@@ -760,9 +851,9 @@ python dataset_replay/scripts/test_replay.py --camera aria --record</code></pre>
       robot.py                    # Articulation setup, DOF resolution, collision control
       rotation.py                 # Quaternion math (pure numpy/scipy)
       ik.py                       # IK solver creation, solving, position-setter factory
-      h5_loader.py                # HDF5 trajectory loading
+      h5_loader.py                # HDF5 trajectory + image loading
       camera.py                   # Camera setup from calibration extrinsics/intrinsics
-      capture.py                  # Viewport video capture pipeline
+      capture.py                  # Video capture: sim viewport, H5 export, side-by-side
       object.py                   # Object spawning + physics (collision, gravity)
       generate_lula_description.py  # Utility to regenerate the Lula YAML
   data/

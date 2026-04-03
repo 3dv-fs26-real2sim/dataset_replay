@@ -20,8 +20,14 @@ def setup_capture(
     fps: float,
     width: int = 1280,
     height: int = 720,
+    deferred: bool = True,
 ):
     """Configure imageio writer and viewport access for in-memory video capture.
+
+    Args:
+        deferred: If True (default), buffer frames in memory and encode after the
+            loop finishes.  Faster replay but uses more RAM.  Set to False for
+            inline per-frame encoding (slower but low memory).
 
     Returns:
         (recorder_dict, output_path) or (None, None) if capture is unavailable.
@@ -39,7 +45,8 @@ def setup_capture(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     writer = imageio.get_writer(str(output_path), fps=max(1, int(round(fps))), codec="libx264")
-    print(f"[capture] Recording replay to {output_path} via imageio ({total_frames} frames target)")
+    mode = "deferred" if deferred else "inline"
+    print(f"[capture] Recording replay to {output_path} via imageio ({total_frames} frames target, {mode} encoding)")
 
     return {
         "writer": writer,
@@ -51,6 +58,9 @@ def setup_capture(
         "frames_written": 0,
         "failed_frames": 0,
         "logged_meta": False,
+        "deferred": deferred,
+        "frames": [],
+        "last_frame": None,
     }, output_path
 
 
@@ -127,19 +137,178 @@ def capture_frame_to_writer(recorder, simulation_app) -> bool:
             )
         return False
 
-    recorder["writer"].append_data(frame)
+    recorder["last_frame"] = frame
+    if recorder["deferred"]:
+        recorder["frames"].append(frame)
+    else:
+        recorder["writer"].append_data(frame)
     recorder["frames_written"] += 1
     return True
 
 
 def close_recorder(recorder) -> None:
-    """Close the video writer."""
+    """Encode any deferred frames and close the video writer."""
     if recorder is None:
         return
+    _encode_deferred_frames(recorder)
     recorder["writer"].close()
 
 
+# ── H5 video export ──────────────────────────────────────────────────────────
+
+
+def export_h5_video(h5_path, camera_name: str, output_path: Path, fps: float):
+    """Extract RGB images from an H5 file and write them to MP4.
+
+    Returns:
+        (output_path, n_frames) on success, (None, 0) if camera data not found.
+    """
+    import h5py
+    from .constants import H5_IMAGE_PATHS
+
+    ds_path = H5_IMAGE_PATHS.get(camera_name)
+    if ds_path is None:
+        print(f"[h5-video] Unknown camera '{camera_name}'. "
+              f"Available: {list(H5_IMAGE_PATHS.keys())}")
+        return None, 0
+
+    with h5py.File(h5_path, "r") as f:
+        if ds_path not in f:
+            print(f"[h5-video] Camera '{camera_name}' ({ds_path}) not found in {h5_path}")
+            return None, 0
+
+        ds = f[ds_path]
+        n_frames = ds.shape[0]
+        print(f"[h5-video] Exporting {n_frames} frames from '{camera_name}' "
+              f"({ds.shape[1]}x{ds.shape[2]}) to {output_path}")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = imageio.get_writer(
+            str(output_path), fps=max(1, int(round(fps))), codec="libx264",
+        )
+
+        for i in range(n_frames):
+            writer.append_data(ds[i])
+            if (i + 1) % 200 == 0:
+                print(f"  [h5-video] {i + 1}/{n_frames}")
+
+        writer.close()
+        print(f"[h5-video] Done: {output_path}")
+        return output_path, n_frames
+
+
+# ── Side-by-side (comparison) capture ────────────────────────────────────────
+
+
+def setup_sidebyside(total_frames, output_path, fps, sim_width, sim_height, h5_path, h5_camera):
+    """Set up side-by-side capture: Isaac Sim viewport (left) + H5 original (right).
+
+    Returns:
+        (recorder_dict, output_path) or (None, None) if H5 camera data is missing.
+    """
+    from .h5_loader import open_h5_images
+
+    h5_file, h5_dataset = open_h5_images(h5_path, h5_camera)
+    if h5_file is None:
+        print(f"[sidebyside] Cannot set up comparison: camera '{h5_camera}' not in {h5_path}")
+        return None, None
+
+    h5_h, h5_w = h5_dataset.shape[1], h5_dataset.shape[2]
+    target_h = max(sim_height, h5_h)
+
+    # Compute scaled widths preserving aspect ratio.
+    sim_w_scaled = round(sim_width * target_h / sim_height) if sim_height != target_h else sim_width
+    h5_w_scaled = round(h5_w * target_h / h5_h) if h5_h != target_h else h5_w
+    out_w = sim_w_scaled + h5_w_scaled
+    # libx264 requires even dimensions.
+    out_w += out_w % 2
+    target_h += target_h % 2
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = imageio.get_writer(str(output_path), fps=max(1, int(round(fps))), codec="libx264")
+    print(f"[sidebyside] Recording comparison to {output_path} "
+          f"({out_w}x{target_h}, {total_frames} frames target)")
+
+    return {
+        "writer": writer,
+        "output_path": output_path,
+        "h5_file": h5_file,
+        "h5_dataset": h5_dataset,
+        "target_h": target_h,
+        "sim_w_scaled": sim_w_scaled,
+        "h5_w_scaled": h5_w_scaled,
+        "out_w": out_w,
+        "frames": [],
+        "frames_written": 0,
+    }, output_path
+
+
+def capture_sidebyside_frame(recorder, sim_frame, frame_idx: int) -> bool:
+    """Compose one side-by-side frame and buffer it for deferred encoding."""
+    if recorder is None or sim_frame is None:
+        return False
+
+    ds = recorder["h5_dataset"]
+    idx = min(frame_idx, ds.shape[0] - 1)
+    h5_frame = ds[idx]
+
+    target_h = recorder["target_h"]
+    left = _resize_to_height(sim_frame, target_h, recorder["sim_w_scaled"])
+    right = _resize_to_height(h5_frame, target_h, recorder["h5_w_scaled"])
+
+    combined = np.concatenate([left, right], axis=1)
+    # Ensure width matches expected (pad if rounding caused 1px difference).
+    if combined.shape[1] < recorder["out_w"]:
+        pad = np.zeros((target_h, recorder["out_w"] - combined.shape[1], 3), dtype=np.uint8)
+        combined = np.concatenate([combined, pad], axis=1)
+    elif combined.shape[1] > recorder["out_w"]:
+        combined = combined[:, :recorder["out_w"], :]
+
+    recorder["frames"].append(combined)
+    recorder["frames_written"] += 1
+    return True
+
+
+def close_sidebyside(recorder) -> None:
+    """Encode deferred frames, close the writer and H5 file handle."""
+    if recorder is None:
+        return
+    _encode_deferred_frames(recorder)
+    recorder["writer"].close()
+    recorder["h5_file"].close()
+
+
 # ── Private helpers ───────────────────────────────────────────────────────────
+
+
+def _encode_deferred_frames(recorder) -> int:
+    """Encode all buffered frames to the video writer. Returns frame count."""
+    frames = recorder.get("frames")
+    if not frames:
+        return 0
+    n = len(frames)
+    print(f"[capture] Encoding {n} buffered frames...")
+    for i, frame in enumerate(frames):
+        recorder["writer"].append_data(frame)
+        if (i + 1) % 200 == 0:
+            print(f"  [capture] encoded {i + 1}/{n}")
+    recorder["frames"] = []
+    print(f"[capture] Encoding complete ({n} frames).")
+    return n
+
+
+def _resize_to_height(frame, target_height: int, target_width: int = 0):
+    """Resize a frame to target_height (and optionally target_width)."""
+    h, w = frame.shape[:2]
+    if h == target_height and (target_width == 0 or w == target_width):
+        return frame
+    from scipy.ndimage import zoom
+    if target_width == 0:
+        scale = target_height / h
+        target_width = round(w * scale)
+    sy = target_height / h
+    sx = target_width / w
+    return zoom(frame, (sy, sx, 1), order=1).astype(np.uint8)
 
 
 def _import_viewport_utility_module():
