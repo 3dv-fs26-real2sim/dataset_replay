@@ -15,6 +15,12 @@ def rotation_matrix_to_wxyz(rot_matrix: np.ndarray) -> np.ndarray:
     return np.array([q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]])
 
 
+def wxyz_to_rotation_matrix(q_wxyz: np.ndarray) -> np.ndarray:
+    """Convert a wxyz quaternion to a 3x3 rotation matrix."""
+    w, x, y, z = q_wxyz
+    return Rotation.from_quat([x, y, z, w]).as_matrix()  # scipy takes xyzw
+
+
 def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Hamilton quaternion product q1*q2, both in wxyz convention."""
     w1, x1, y1, z1 = q1

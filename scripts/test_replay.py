@@ -1,6 +1,8 @@
 import argparse
 
 from utils.app import add_common_args, create_app, resolve_usd_path, resolve_h5_path
+# constants.py has no Isaac Sim deps — safe to import before SimulationApp.
+from utils.constants import CAMERA_CONFIGS
 
 parser = argparse.ArgumentParser(description="Replay H5 trajectory with IK")
 add_common_args(parser)
@@ -17,10 +19,27 @@ parser.add_argument(
     "--no-collision", action="store_true",
     help="Disable collision between robots and the table (/World/Cube)",
 )
+parser.add_argument(
+    "--camera", type=str, default=None, choices=list(CAMERA_CONFIGS.keys()),
+    help="Set viewport to a calibrated camera (default: use Isaac Sim default viewport)",
+)
 args = parser.parse_args()
 
-APP_WIDTH = 1280
-APP_HEIGHT = 720
+# Match the app/capture resolution to the camera's aspect ratio so the
+# recorded video isn't stretched.  Target ~720 px on the shorter side.
+_TARGET_SHORT = 720
+if args.camera is not None:
+    _intr = CAMERA_CONFIGS[args.camera]["intrinsics"]
+    _cam_w, _cam_h = _intr["width"], _intr["height"]
+    if _cam_w >= _cam_h:
+        APP_HEIGHT = _TARGET_SHORT
+        APP_WIDTH  = round(_TARGET_SHORT * _cam_w / _cam_h)
+    else:
+        APP_WIDTH  = _TARGET_SHORT
+        APP_HEIGHT = round(_TARGET_SHORT * _cam_h / _cam_w)
+else:
+    APP_WIDTH  = 1280
+    APP_HEIGHT = 720
 simulation_app = create_app(args, width=APP_WIDTH, height=APP_HEIGHT)
 
 # Isaac Sim imports must come after SimulationApp creation.
@@ -35,12 +54,14 @@ from utils.constants import (
     EE_FRAME_NAME_LEFT, EE_FRAME_NAME_RIGHT,
     LULA_DESCRIPTOR_PATH, URDF_PATH_LEFT, URDF_PATH_RIGHT,
     WRIST_HOME_POSITION, WRIST_HOME_ROTATION,
+    EE_WRIST_OFFSET_IN_LINK8,
 )
 from utils.rotation import rotation_matrix_to_wxyz, detect_quaternion_order
 from utils.h5_loader import load_h5
 from utils.robot import setup_articulation, resolve_dof_indices, print_dof_info, set_collision_enabled
 from utils.ik import create_ik_solver, solve_ik_for_pose, make_ik_position_setter
 from utils.capture import setup_capture, capture_frame_to_writer, close_recorder
+from utils.camera import setup_camera
 
 
 def main():
@@ -69,9 +90,17 @@ def main():
         franka_left = setup_articulation(FRANKA_LEFT_PATH, world)
     world.reset()
 
+    stage = omni.usd.get_context().get_stage()
+
     if args.no_collision:
-        stage = omni.usd.get_context().get_stage()
         set_collision_enabled(stage, "/World/Cube", False)
+
+    if args.camera is not None:
+        camera_prim_path = setup_camera(
+            stage, args.camera, args.mode,
+            FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
+        )
+        print(f"[camera] Viewport set to {camera_prim_path}")
 
     # Create per-side IK solvers.
     ik_solver_right = create_ik_solver(URDF_PATH_RIGHT, LULA_DESCRIPTOR_PATH, "right")
@@ -79,15 +108,17 @@ def main():
         ik_solver_left = create_ik_solver(URDF_PATH_LEFT, LULA_DESCRIPTOR_PATH, "left")
 
     # Compute home arm joint values via IK.
+    # WRIST_HOME_POSITION is the desired EE wrist location; shift to fer_link8 frame.
     home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
+    home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
     home_arm_joints, _ = solve_ik_for_pose(
         ik_solver_right, EE_FRAME_NAME_RIGHT,
-        WRIST_HOME_POSITION, home_wrist_quat,
+        home_fer_link8_pos, home_wrist_quat,
     )
     if home_arm_joints is None:
         raise RuntimeError(
             f"IK failed for home wrist pose "
-            f"(pos={WRIST_HOME_POSITION}, quat={home_wrist_quat}). "
+            f"(fer_link8_pos={home_fer_link8_pos}, quat={home_wrist_quat}). "
             f"Check EE_FRAME_NAME_RIGHT='{EE_FRAME_NAME_RIGHT}' and the Lula descriptor."
         )
     print(f"[IK] Home arm joints RIGHT (rad): {home_arm_joints}")
@@ -95,12 +126,12 @@ def main():
     if args.mode == "dual":
         home_arm_joints_left, _ = solve_ik_for_pose(
             ik_solver_left, EE_FRAME_NAME_LEFT,
-            WRIST_HOME_POSITION, home_wrist_quat,
+            home_fer_link8_pos, home_wrist_quat,
         )
         if home_arm_joints_left is None:
             raise RuntimeError(
                 f"IK failed for left arm home wrist pose "
-                f"(pos={WRIST_HOME_POSITION}, quat={home_wrist_quat}). "
+                f"(fer_link8_pos={home_fer_link8_pos}, quat={home_wrist_quat}). "
                 f"Check EE_FRAME_NAME_LEFT='{EE_FRAME_NAME_LEFT}' and the Lula descriptor."
             )
         print(f"[IK] Home arm joints LEFT  (rad): {home_arm_joints_left}")
@@ -130,12 +161,14 @@ def main():
         franka_right, arm_idx_right, hand_idx_right,
         ik_solver_right, EE_FRAME_NAME_RIGHT,
         HAND_HOME_JOINT_VALUES, home_arm_joints,
+        ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
     )
     if args.mode == "dual":
         set_left = make_ik_position_setter(
             franka_left, arm_idx_left, hand_idx_left,
             ik_solver_left, EE_FRAME_NAME_LEFT,
             HAND_HOME_JOINT_VALUES, home_arm_joints_left,
+            ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
         )
 
     # Video capture setup.

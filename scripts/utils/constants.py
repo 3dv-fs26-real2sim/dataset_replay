@@ -71,6 +71,11 @@ HAND_HOME_JOINT_VALUES    = np.array([0.0] * N_HAND_DOFS)
 EE_FRAME_NAME_LEFT  = "fer_link8"
 EE_FRAME_NAME_RIGHT = "fer_link8"
 
+# The EE wrist (as recorded in H5 data) is offset from fer_link8 in fer_link8's
+# local frame.  To position the EE wrist at a target, the IK must aim fer_link8
+# at: target_pos - R_fer_link8 @ EE_WRIST_OFFSET_IN_LINK8.
+EE_WRIST_OFFSET_IN_LINK8 = np.array([0.13, 0.0, 0.07])
+
 # Home wrist target pose for IK.
 # position  = [0.40, 0.0, 0.3]
 # rotation  = x=[1,0,0], z=[0,0,-1]  →  R = [[1,0,0],[0,-1,0],[0,0,-1]]
@@ -81,9 +86,60 @@ WRIST_HOME_ROTATION = np.array([
     [0,  0, -1],
 ], dtype=float)
 
-HOME_HOLD_SECONDS = 3.0
+HOME_HOLD_SECONDS = 0.0
 
 # H5 data uses a tool-frame convention where identity = hand pointing down.
 # The URDF fer_link7/8 frame has Rx(180°) when the hand points down.
 # Pre-multiply by Rx(180°) to convert from tool convention to URDF convention.
 Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])  # Rx(180°) in wxyz
+
+# ── Camera calibration ───────────────────────────────────────────────────────
+# Extrinsics: T_base_from_cam (4x4 homogeneous, transforms cam-frame → base-frame).
+# T[:3, 3] = camera origin in base coordinates.
+# To get camera world pose: T_world_cam = T_world_base @ T_base_from_cam
+
+ARIA_EXTRINSICS = {
+    "left": np.array([[-0.02199727, -0.80581615,  0.59175708,  0.20403467],
+                      [-0.99905014,  0.03998766,  0.01731508, -0.25486327],
+                      [-0.03761575, -0.59081411, -0.80593036,  0.43379187],
+                      [ 0.        ,  0.        ,  0.        ,  1.        ]]),
+    "right": np.array([[ 0.02933941, -0.83227828,  0.55358113,  0.17515134],
+                       [-0.99642232,  0.01956109,  0.0822187 ,  0.34649483],
+                       [-0.07925749, -0.55401284, -0.82872675,  0.46895363],
+                       [ 0.        ,  0.        ,  0.        ,  1.        ]]),
+}
+
+# Aria Gen 1 intrinsics — full resolution (640×480).
+# Derived from calibrated focal length 133.25430222 px at half-res,
+# scaled ×2 for full-res.  cx/cy are principal point (image centre).
+ARIA_INTRINSICS = {
+    "width": 640,
+    "height": 480,
+    "fx": 133.25430222 * 2,   # 266.50860444
+    "fy": 133.25430222 * 2,   # 266.50860444
+    "cx": 320.0,
+    "cy": 240.0,
+}
+
+# Aria Gen 1 intrinsics — half resolution (320×240).
+ARIA_INTRINSICS_HALF = {
+    "width": 320,
+    "height": 240,
+    "fx": 133.25430222,
+    "fy": 133.25430222,
+    "cx": 160.0,
+    "cy": 120.0,
+}
+
+# Registry of camera configs.  Extend when adding new cameras (e.g., OAK-D).
+CAMERA_CONFIGS = {
+    "aria": {
+        "extrinsics": ARIA_EXTRINSICS,
+        "intrinsics": ARIA_INTRINSICS,
+    },
+    "aria_half": {
+        "extrinsics": ARIA_EXTRINSICS,
+        "intrinsics": ARIA_INTRINSICS_HALF,
+    },
+    # "oakd": { "extrinsics": OAKD_EXTRINSICS, "intrinsics": OAKD_INTRINSICS },
+}

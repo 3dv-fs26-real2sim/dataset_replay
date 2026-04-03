@@ -61,7 +61,7 @@ scripts/
 | Script | Description |
 |---|---|
 | `test_setup.py` | Loads a USD scene, creates robot articulations, sets home joint values, and runs the simulation loop. Use this to verify the scene loads correctly. |
-| `test_replay.py` | The main script. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. Supports `--record` for video, `--no-collision` to disable table collision. See `docs/test_replay.html` for detailed documentation. |
+| `test_replay.py` | The main script. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. Supports `--record` for video, `--no-collision` to disable table collision, `--camera aria` to view from the calibrated Aria camera. See `docs/test_replay.html` for detailed documentation. |
 | `test_object_spawn.py` | Spawns a selected object (ball, duck, fish, grape, shovel) onto the table with rigid body physics. Use `--object`, `--position`, `--scale` to configure. |
 
 ### Utility Modules (`scripts/utils/`)
@@ -74,6 +74,7 @@ scripts/
 | `rotation.py` | No | Pure quaternion math: `rotation_matrix_to_wxyz()`, `quat_multiply()`, `tool_quat_to_urdf()` (H5 tool-frame → URDF convention via Rx(180°)), `detect_quaternion_order()` (auto-detect wxyz vs xyzw). |
 | `ik.py` | Yes (deferred) | `create_ik_solver()` builds a Lula IK solver from URDF + descriptor. `solve_ik_for_pose()` solves IK for a target pose. `make_ik_position_setter()` returns a per-frame closure with warm-start tracking. |
 | `h5_loader.py` | No | `load_h5()` loads arm wrist poses and hand joint angles from HDF5 files. Supports both `observations/qpos_*` and `actions_*` key schemas, single and dual arm modes. |
+| `camera.py` | Yes (deferred) | Camera setup from real-world calibration. Computes camera world pose from extrinsics + robot base transforms, creates a USD camera prim with intrinsics, and sets it as the active viewport. Supports Aria Gen 1 (extensible to OAK-D). |
 | `capture.py` | Yes (deferred) | `setup_capture()` / `capture_frame_to_writer()` / `close_recorder()` handle viewport-to-MP4 recording via imageio. Handles multiple Kit buffer formats (numpy, memoryview, raw pointer, PyCapsule). |
 | `object.py` | Yes (deferred) | `spawn_object()` loads an OBJ mesh into the scene and enables rigid body physics with convex hull collision. |
 

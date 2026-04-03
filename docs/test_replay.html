@@ -46,6 +46,7 @@
   <li><a href="#h5-format">H5 Data Format</a></li>
   <li><a href="#lula-yaml">Lula Robot Descriptor YAML</a></li>
   <li><a href="#ik-solver">IK Solver</a></li>
+  <li><a href="#camera-setup">Camera Setup</a></li>
   <li><a href="#functions">Function-by-Function Reference</a></li>
   <li><a href="#main-function">The main() Function</a></li>
   <li><a href="#video-capture">Video Capture System</a></li>
@@ -83,6 +84,7 @@
   <li><strong>Detect quaternion ordering</strong> &mdash; auto-detect whether the h5 quaternions are wxyz or xyzw and reorder to wxyz if needed. The IK solver requires wxyz (scalar-first).</li>
   <li><strong>Open USD stage</strong> &mdash; load the pre-built scene containing the robot(s) and environment.</li>
   <li><strong>Create World and articulations</strong> &mdash; Isaac Sim's physics world, with one or two <code>SingleArticulation</code> objects wrapping the robot prims. If <code>--no-collision</code> is set, collision is disabled on the table (<code>/World/Cube</code>).</li>
+  <li><strong>Set up calibrated camera</strong> (if <code>--camera</code>) &mdash; compute the camera world pose from extrinsics and robot base transforms, create a USD camera prim, and set it as the active viewport. See <a href="#camera-setup">Camera Setup</a>.</li>
   <li><strong>Create IK solvers</strong> &mdash; one per arm side (different URDFs for left/right because the EE frames are in the hand portion).</li>
   <li><strong>Compute home arm pose via IK</strong> &mdash; solve for joint angles that achieve <code>WRIST_HOME_POSITION</code> + <code>WRIST_HOME_ROTATION</code>.</li>
   <li><strong>Resolve DOF indices</strong> &mdash; map canonical joint names (e.g. <code>panda_joint1</code>) to the articulation's internal DOF array indices.</li>
@@ -114,10 +116,11 @@ separated by <code>SimulationApp</code> construction:</p>
   <li><code>utils.robot</code> &mdash; articulation setup, DOF resolution, collision control</li>
   <li><code>utils.ik</code> &mdash; IK solver creation, solving, position-setter factory</li>
   <li><code>utils.capture</code> &mdash; viewport video capture pipeline</li>
+  <li><code>utils.camera</code> &mdash; camera setup from calibration extrinsics/intrinsics</li>
 </ul>
 <p>Modules without Isaac Sim dependencies (<code>constants</code>, <code>rotation</code>,
 <code>h5_loader</code>) are safe to import at any time. Modules with Isaac Sim dependencies
-(<code>robot</code>, <code>ik</code>, <code>capture</code>, <code>object</code>) must be
+(<code>robot</code>, <code>ik</code>, <code>capture</code>, <code>camera</code>, <code>object</code>) must be
 imported after <code>create_app()</code> returns.</p>
 <div class="warn">
   If you import <code>omni.*</code> or <code>isaacsim.core.*</code> before constructing <code>SimulationApp</code>,
@@ -170,6 +173,21 @@ Other candidates include <code>"left_wrist_jointbody"</code> / <code>"right_wris
   rotation offset. You just need to tell it what world-frame orientation you want <em>that particular link</em> to have.
 </div>
 
+<h4><code>EE_WRIST_OFFSET_IN_LINK8</code></h4>
+<pre><code>EE_WRIST_OFFSET_IN_LINK8 = [0.13, 0.0, 0.07]   # meters, in fer_link8 local frame</code></pre>
+<p>The physical EE wrist (as recorded in H5 data) is not at the origin of <code>fer_link8</code> &mdash; it is
+offset by <code>[0.13, 0, 0.07]</code> in <code>fer_link8</code>'s local coordinate frame. This shifts the hand
+<strong>back</strong> (&#x2212;X in world frame at nominal pose) and <strong>above</strong> (+Z in world frame)
+relative to the flange origin.</p>
+<p>Because the IK solver places <code>fer_link8</code>'s origin at the requested position, we must compensate:
+the IK target is shifted from the EE wrist position to the <code>fer_link8</code> origin:</p>
+<pre><code>ik_position = ee_wrist_pos - R_fer_link8 @ EE_WRIST_OFFSET_IN_LINK8</code></pre>
+<p>This is applied in two places:</p>
+<ol>
+  <li><strong>Home pose</strong> &mdash; <code>test_replay.py</code> computes <code>home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8</code> before calling <code>solve_ik_for_pose()</code>.</li>
+  <li><strong>Per-frame replay</strong> &mdash; <code>make_ik_position_setter()</code> accepts <code>ee_wrist_offset</code> and applies the same shift inside <code>set_positions()</code> using the per-frame URDF-convention orientation.</li>
+</ol>
+
 <h4><code>LULA_DESCRIPTOR_PATH</code> / <code>URDF_PATH_LEFT</code> / <code>URDF_PATH_RIGHT</code></h4>
 <p>The Lula IK solver requires two files: a robot descriptor YAML and a URDF. The descriptor is shared
 (same arm cspace for both sides), but the URDFs differ because the left and right extended URDFs contain
@@ -177,13 +195,15 @@ different hand link names (<code>left_wrist_jointbody</code> vs <code>right_wris
 This means we create <strong>two separate solver instances</strong>, one per side.</p>
 
 <h4><code>WRIST_HOME_POSITION</code> / <code>WRIST_HOME_ROTATION</code></h4>
-<pre><code>WRIST_HOME_POSITION = [0.40, 0.0, 0.3]   # meters, in world frame
+<pre><code>WRIST_HOME_POSITION = [0.40, 0.0, 0.3]   # EE wrist target, meters in world frame
 WRIST_HOME_ROTATION = [[1,  0,  0],
                        [0, -1,  0],
                        [0,  0, -1]]</code></pre>
-<p>The target pose for the home arm configuration, solved via IK at startup. The rotation matrix is built
-from the rule <code>x=[1,0,0], z=[0,0,-1]</code> with <code>y = z &times; x = [0,-1,0]</code>. This matrix
-is converted to a wxyz quaternion before being passed to the solver.</p>
+<p>The target pose for the home arm configuration, defined in terms of the <strong>EE wrist</strong> position.
+The rotation matrix is built from the rule <code>x=[1,0,0], z=[0,0,-1]</code> with <code>y = z &times; x = [0,-1,0]</code>.
+Before IK, the position is shifted to the <code>fer_link8</code> origin using <code>EE_WRIST_OFFSET_IN_LINK8</code>
+(resulting in approximately <code>[0.27, 0.0, 0.37]</code>).
+The rotation matrix is converted to a wxyz quaternion before being passed to the solver.</p>
 
 <h4><code>HAND_HOME_JOINT_VALUES</code></h4>
 <p>All zeros. The hand starts fully open. Per-frame hand data is added as offsets to these values.</p>
@@ -379,6 +399,60 @@ which matches the URDF and the h5 data. If your stage uses centimeters, the solv
 
 
 <!-- ======================================================================= -->
+<h2 id="camera-setup">Camera Setup</h2>
+<p>The <code>--camera</code> flag positions the Isaac Sim viewport camera to match a real-world calibrated
+camera. Currently supported: <strong>Aria Gen 1</strong> glasses. The system is designed to support
+additional cameras (e.g., OAK-D) by adding entries to <code>CAMERA_CONFIGS</code> in <code>constants.py</code>.</p>
+
+<h3>How It Works</h3>
+<ol>
+  <li><strong>Extrinsics</strong> &mdash; each camera has a pair of 4&times;4 homogeneous transforms
+      (<code>T_base_from_cam</code>), one per robot arm base. These describe the camera&rsquo;s position and
+      orientation in each arm&rsquo;s base frame.</li>
+  <li><strong>Base world transforms</strong> &mdash; the world-frame pose of each robot base is read from the USD
+      stage at runtime via <code>UsdGeom.XformCache</code>.</li>
+  <li><strong>Camera world pose</strong> &mdash; computed as
+      <code>T_world_cam = T_world_base &times; T_base_from_cam</code> for each arm.</li>
+  <li><strong>Averaging</strong> &mdash; in dual mode, the left and right results are averaged
+      (arithmetic mean of positions, rotation mean via <code>scipy.spatial.transform.Rotation.mean()</code>).
+      In single mode only the right arm&rsquo;s extrinsic is used.</li>
+  <li><strong>USD camera creation</strong> &mdash; a <code>UsdGeom.Camera</code> prim is created at
+      <code>/World/{Name}Camera</code> with the computed pose and pinhole intrinsics.</li>
+  <li><strong>Viewport activation</strong> &mdash; the new camera is set as the active viewport camera.
+      Video capture (<code>--record</code>) automatically uses whatever camera is active.</li>
+</ol>
+
+<h3>CV &harr; USD Camera Convention</h3>
+<p>Computer-vision cameras look along <strong>+Z</strong>; USD cameras follow the OpenGL convention and
+look along <strong>&minus;Z</strong>. A 180&deg; rotation around X
+(<code>diag(1, &minus;1, &minus;1, 1)</code>) is applied to the pose before writing it to the USD prim.</p>
+
+<h3>Intrinsics</h3>
+<p>Pinhole parameters (<code>fx</code>, <code>fy</code>, <code>cx</code>, <code>cy</code>) are mapped to
+USD camera attributes (<code>focalLength</code>, <code>horizontalAperture</code>,
+<code>verticalAperture</code>, aperture offsets). The current Aria intrinsics are <strong>placeholders</strong>
+&mdash; update <code>ARIA_INTRINSICS</code> in <code>constants.py</code> once exact calibration values are available.</p>
+
+<h3>Adding a New Camera</h3>
+<p>To add a new camera (e.g., OAK-D):</p>
+<ol>
+  <li>Define <code>OAKD_EXTRINSICS</code> and <code>OAKD_INTRINSICS</code> in <code>constants.py</code>.</li>
+  <li>Add an <code>"oakd"</code> entry to <code>CAMERA_CONFIGS</code>.</li>
+  <li>Add <code>"oakd"</code> to the <code>--camera</code> choices list in <code>test_replay.py</code>.</li>
+</ol>
+
+<h3>Camera Module Functions (<code>utils/camera.py</code>)</h3>
+<table>
+  <tr><th>Function</th><th>Description</th></tr>
+  <tr><td><code>setup_camera()</code></td><td>High-level orchestrator: looks up config, computes pose, creates prim, sets viewport.</td></tr>
+  <tr><td><code>compute_camera_world_pose()</code></td><td>Transforms extrinsics through robot base world poses, averages in dual mode.</td></tr>
+  <tr><td><code>get_prim_world_transform()</code></td><td>Reads a prim&rsquo;s composed world transform from the USD stage.</td></tr>
+  <tr><td><code>create_camera_prim()</code></td><td>Creates a <code>UsdGeom.Camera</code> with pose and intrinsics.</td></tr>
+  <tr><td><code>set_viewport_camera()</code></td><td>Sets the active viewport to render from the given camera.</td></tr>
+</table>
+
+
+<!-- ======================================================================= -->
 <h2 id="functions">Function-by-Function Reference</h2>
 <p>Functions are organized into utility modules under <code>scripts/utils/</code>. Each heading shows the module and function name.</p>
 
@@ -441,7 +515,7 @@ Validates shapes against <code>N_ARM_POSE_DIMS</code> and <code>N_HAND_DOFS</cod
 Returns a dict with keys <code>"arm_left"</code>, <code>"arm_right"</code>, <code>"hand_left"</code>,
 <code>"hand_right"</code>, <code>"n_frames"</code>.</p>
 
-<h3><code>utils.ik.</code><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_home, home_arm_joints)</h3>
+<h3><code>utils.ik.</code><code class="fn">make_ik_position_setter</code>(art, arm_idx, hand_idx, ik_solver, ee_frame_name, hand_home, home_arm_joints, ee_wrist_offset=None)</h3>
 <p>This is the core function. It returns a <strong>closure</strong> (<code>set_positions</code>) that captures all the
 setup state and is called once per frame during replay.</p>
 <p>Internal state (captured in the closure):</p>
@@ -454,7 +528,8 @@ setup state and is called once per frame during replay.</p>
 <p>The returned <code>set_positions(wrist_pose, q_hand)</code> function:</p>
 <ol>
   <li>Splits <code>wrist_pose</code> into position (xyz) and orientation (wxyz quaternion), then converts the quaternion from tool-frame to URDF convention via <code>tool_quat_to_urdf()</code> (see <a href="#quat-convention">Quaternion Convention</a>).</li>
-  <li>Calls <code>solve_ik_for_pose()</code> with the previous solution as warm-start.</li>
+  <li>If <code>ee_wrist_offset</code> was supplied: converts the orientation to a rotation matrix and shifts the IK target from the EE wrist to the <code>ee_frame</code> origin: <code>ik_position = position - R @ ee_wrist_offset</code>.</li>
+  <li>Calls <code>solve_ik_for_pose()</code> with the shifted position and the previous solution as warm-start.</li>
   <li>If IK succeeds: writes the new arm joints to <code>buf</code> and updates <code>prev_arm_joints</code>.</li>
   <li>If IK fails: increments the failure counter and reuses the previous solution (arm holds steady).</li>
   <li>Writes <code>hand_home + q_hand</code> to the hand DOF indices.</li>
@@ -489,16 +564,21 @@ ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, LULA_DESCRIPTOR_PATH, "left")
 
 <h3>Step 4: Compute home arm joints</h3>
 <pre><code>home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
+home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
 home_arm_joints, _ = solve_ik_for_pose(
     ik_solver_right, EE_FRAME_NAME_RIGHT,
-    WRIST_HOME_POSITION, home_wrist_quat,
+    home_fer_link8_pos, home_wrist_quat,
 )
 # In dual mode, a separate home IK is computed for the left arm:
 home_arm_joints_left, _ = solve_ik_for_pose(
     ik_solver_left, EE_FRAME_NAME_LEFT,
-    WRIST_HOME_POSITION, home_wrist_quat,
+    home_fer_link8_pos, home_wrist_quat,
 )</code></pre>
-<p>The rotation matrix is converted to a wxyz quaternion, then IK is solved for the right solver.
+<p><code>WRIST_HOME_POSITION</code> is the desired <strong>EE wrist</strong> location.
+Before passing to the IK solver (which targets <code>fer_link8</code>), the position is shifted
+by <code>EE_WRIST_OFFSET_IN_LINK8</code> rotated into world frame via <code>WRIST_HOME_ROTATION</code>.
+At the nominal home orientation this shifts the IK target from <code>[0.40, 0.0, 0.30]</code>
+to approximately <code>[0.27, 0.0, 0.37]</code>.
 In dual mode, a <strong>separate</strong> home IK is also computed for the left arm using its own
 solver (<code>ik_solver_left</code>). Each arm&rsquo;s home solution is used as the initial warm
 start for its respective IK closure, ensuring the warm-start chain begins in the correct
@@ -514,12 +594,14 @@ internal DOF array. Then the IK-computed arm joints and zero hand joints are wri
     franka_right, arm_idx_right, hand_idx_right,
     ik_solver_right, EE_FRAME_NAME_RIGHT,
     HAND_HOME_JOINT_VALUES, home_arm_joints,
+    ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
 )
 # In dual mode, the left arm uses its own home IK solution:
 set_left = make_ik_position_setter(
     franka_left, arm_idx_left, hand_idx_left,
     ik_solver_left, EE_FRAME_NAME_LEFT,
     HAND_HOME_JOINT_VALUES, home_arm_joints_left,
+    ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
 )</code></pre>
 <p>These closures are the per-frame workhorses. Each one captures its own IK solver, DOF indices,
 and warm-start state. The <code>home_arm_joints</code> / <code>home_arm_joints_left</code> argument
@@ -577,6 +659,7 @@ All capture logic lives in <code>utils/capture.py</code>. Key functions:</p>
   <tr><td><code>--mode {single,dual}</code></td><td>dual</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
   <tr><td><code>--record</code> / <code>--no-record</code></td><td>off</td><td>Enable/disable MP4 recording to <code>outputs/&lt;H5_STEM&gt;_replay.mp4</code>.</td></tr>
   <tr><td><code>--no-collision</code></td><td>off</td><td>Disable collision between the robots and the table (<code>/World/Cube</code>). Useful when the replay trajectory passes through the table geometry.</td></tr>
+  <tr><td><code>--camera {aria}</code></td><td>None</td><td>Set the viewport to a calibrated real-world camera. Uses extrinsics from <code>constants.py</code> to position the camera relative to the robot arm bases. When omitted, the default Isaac Sim viewport is used. See <a href="#camera-setup">Camera Setup</a>.</td></tr>
 </table>
 
 
@@ -617,7 +700,13 @@ python dataset_replay/scripts/test_replay.py --record
 python dataset_replay/scripts/test_replay.py --use-actions
 
 # Custom frame rate
-python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
+python dataset_replay/scripts/test_replay.py --fps 30
+
+# View from calibrated Aria camera
+python dataset_replay/scripts/test_replay.py --camera aria
+
+# Aria camera with recording
+python dataset_replay/scripts/test_replay.py --camera aria --record</code></pre>
 
 <h3>Regenerating the Lula Descriptor</h3>
 <pre><code>python dataset_replay/scripts/utils/generate_lula_description.py \
@@ -672,6 +761,7 @@ python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
       rotation.py                 # Quaternion math (pure numpy/scipy)
       ik.py                       # IK solver creation, solving, position-setter factory
       h5_loader.py                # HDF5 trajectory loading
+      camera.py                   # Camera setup from calibration extrinsics/intrinsics
       capture.py                  # Viewport video capture pipeline
       object.py                   # Object spawning + physics (collision, gravity)
       generate_lula_description.py  # Utility to regenerate the Lula YAML
