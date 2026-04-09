@@ -1,2 +1,0 @@
-- Files for ball, duck are from the other real2sim team. Texture missing. 
-- Files for fishthick, grape, shovel_sharpfusion selected from our team. 
