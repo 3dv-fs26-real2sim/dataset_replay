@@ -1,3 +1,4 @@
 *.h5
 *.mp4
+*.npz
 __pycache__/
