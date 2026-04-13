@@ -1,24 +1,128 @@
-"""Object spawning and physics setup for Isaac Sim scenes.
+"""Object spawning, pose updates, and collision filtering for Isaac Sim scenes.
 
-Depends on pxr types — must be imported after SimulationApp is created.
+Depends on pxr / Isaac Sim types — must be imported after SimulationApp is created.
 """
 
 import importlib
 from pathlib import Path
 
-from pxr import Gf, PhysxSchema, Usd, UsdGeom, UsdPhysics
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
+
+
+#* THe mode does not support dual. Current dataset only uses single but fix if needed. 
+def load_object_world_trajectory(
+    stage,
+    object_name: str,
+    object_poses_override: str | None,
+    object_pose_camera: str,
+    n_frames: int,
+    mode: str,
+    right_prim_path: str,
+):
+    """Load an object's 6D pose trajectory and transform it to world frame.
+
+    Handles the full pipeline: resolve the .npz path, load the camera-frame
+    trajectory, compute the camera-to-world transform via robot-base extrinsics,
+    and warn if the trajectory length doesn't match the H5 frame count.
+
+    Args:
+        stage: USD stage (needed for robot-base world transforms).
+        object_name: Object name (e.g. ``"duck"``).  ``"none"`` skips loading.
+        object_poses_override: Explicit .npz path, or ``None`` for default lookup.
+        object_pose_camera: Camera name whose extrinsics define the pose frame.
+        n_frames: Expected frame count from the H5 dataset.
+        mode: Replay mode (``"single"`` or ``"dual"``).
+        right_prim_path: Prim path of the right robot arm.
+
+    Returns:
+        ``(N, 4, 4)`` array of world-frame transforms, or ``None`` if the
+        object should not be spawned.
+    """
+    from .constants import CAMERA_CONFIGS
+    from .poses import load_pose_trajectory, transform_trajectory
+    from .camera import compute_camera_world_pose
+
+    if object_name == "none":
+        print("[object] Object spawning disabled (--object none).")
+        return None
+    if mode != "single":
+        print(f"[object] Skipping object spawn — only available in --mode single (got {mode})")
+        return None
+
+    npz_path = resolve_object_pose_path(object_name, object_poses_override)
+    if npz_path is None:
+        print(
+            f"[object] No default pose trajectory for '{object_name}'. "
+            f"Pass --object-poses to provide one. Skipping spawn."
+        )
+        return None
+
+    traj_cam = load_pose_trajectory(npz_path)
+    print(f"[object] Loaded {traj_cam.shape[0]} poses from {npz_path}")
+
+    # Camera frame -> world frame.
+    cam_cfg = CAMERA_CONFIGS[object_pose_camera]
+    T_world_cam = compute_camera_world_pose(
+        stage, cam_cfg["extrinsics"],
+        left_prim_path=None,  # single mode
+        right_prim_path=right_prim_path,
+    )
+    traj_world = transform_trajectory(T_world_cam, traj_cam)
+
+    if traj_world.shape[0] != n_frames:
+        print(
+            f"[object] WARNING: trajectory has {traj_world.shape[0]} frames, "
+            f"H5 has {n_frames}. Will use min(N, n_frames) frames during replay."
+        )
+
+    return traj_world
+
+
+def resolve_object_pose_path(object_name: str, object_poses_override: str | None = None):
+    """Find the .npz pose trajectory for the chosen object, or None to skip spawn.
+
+    Args:
+        object_name: Object name (must be a key in ``OBJECT_POSE_PATHS``, or
+            any string when ``object_poses_override`` is given).
+        object_poses_override: Explicit path to a .npz file.  When provided,
+            this takes precedence over the default lookup.
+
+    Returns:
+        ``Path`` to the .npz file, or ``None`` if no trajectory is available.
+    """
+    from .constants import OBJECT_POSE_PATHS
+
+    if object_poses_override is not None:
+        return Path(object_poses_override)
+    return OBJECT_POSE_PATHS.get(object_name)
 
 
 def spawn_object(
     stage,
     object_name: str,
-    position: list[float],
+    position,
     scale: float,
     objects_dir: Path,
+    *,
+    kinematic: bool = False,
 ) -> str:
     """Spawn an OBJ mesh into the scene with physics enabled.
 
-    Returns the prim path of the spawned object.
+    Args:
+        stage: USD stage.
+        object_name: Name of the object directory under ``objects_dir``.
+        position: Initial ``(x, y, z)`` world position.
+        scale: Uniform scale factor.
+        objects_dir: Root directory containing per-object subfolders with ``.obj`` files.
+        kinematic: When ``True``, the rigid body is *kinematic*: gravity is disabled
+            and the body will not respond to forces. Use with ``set_object_world_pose``
+            to drive it from an external trajectory (e.g. a 6D pose estimator).
+
+    Returns:
+        The prim path of the spawned object.
     """
     try:
         kit_commands = importlib.import_module("omni.kit.commands")
@@ -46,6 +150,16 @@ def spawn_object(
         instanceable=False,
     )
 
+    # The OBJ importer adds a rotateX:unitsResolve = 90° to the visual sub-prim
+    # (Y-up → Z-up conversion), but our Artec-scanned meshes are already Z-up.
+    # Zero out the spurious rotation while keeping the cm→m unit-conversion scale.
+    visual_prim = stage.GetPrimAtPath(ref_path)
+    if visual_prim and visual_prim.IsValid():
+        xformable = UsdGeom.Xformable(visual_prim)
+        for op in xformable.GetOrderedXformOps():
+            if "rotate" in op.GetOpName().lower():
+                op.Set(0.0)
+
     prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
         raise RuntimeError(f"Failed to create object prim at {prim_path}")
@@ -53,18 +167,142 @@ def spawn_object(
     xform_api = UsdGeom.XformCommonAPI(prim)
     xform_api.SetTranslate(Gf.Vec3d(position[0], position[1], position[2]))
     xform_api.SetScale(Gf.Vec3f(scale, scale, scale))
-    _enable_collision_and_gravity(prim)
+    _setup_rigid_body(prim, kinematic=kinematic)
     return prim_path
 
 
-def _enable_collision_and_gravity(root_prim: Usd.Prim) -> None:
-    """Make object dynamic and affected by gravity."""
+def set_object_world_pose(stage, prim_path: str, T_world_obj: np.ndarray) -> None:
+    """Update an object's world pose from a 4x4 homogeneous transform.
+
+    Translation and rotation are written via ``XformCommonAPI``; the scale set
+    at spawn time is left untouched. Designed for per-frame trajectory replay
+    of kinematic rigid bodies.
+    """
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Object prim not found: {prim_path}")
+
+    pos = T_world_obj[:3, 3]
+    eul_xyz_deg = Rotation.from_matrix(T_world_obj[:3, :3]).as_euler("XYZ", degrees=True)
+
+    xform_api = UsdGeom.XformCommonAPI(prim)
+    xform_api.SetTranslate(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+    xform_api.SetRotate(
+        Gf.Vec3f(float(eul_xyz_deg[0]), float(eul_xyz_deg[1]), float(eul_xyz_deg[2])),
+        UsdGeom.XformCommonAPI.RotationOrderXYZ,
+    )
+
+
+#* For dynamic_replay.py, but very much experimental only. We need a better idea.
+def create_d6_tracking_joint(
+    stage,
+    object_prim_path: str,
+    initial_pose: "np.ndarray",
+    stiffness: float = 500.0,
+    damping: float = 100.0,
+) -> str:
+    """Create a kinematic anchor and D6 joint with spring-damper drives.
+
+    The anchor follows the estimated trajectory each frame (via
+    ``set_object_world_pose``); the D6 joint's spring-damper drives pull the
+    dynamic object toward the anchor while PhysX resolves collisions, gravity,
+    and contact forces.
+
+    Args:
+        stage: USD stage.
+        object_prim_path: Prim path of the **dynamic** rigid body object.
+        initial_pose: 4x4 homogeneous transform for the anchor's starting pose.
+        stiffness: Spring stiffness (N/m for translation, N*m/rad for rotation).
+        damping: Damping coefficient for all 6 DOF drives.
+
+    Returns:
+        The prim path of the kinematic anchor.
+    """
+    from scipy.spatial.transform import Rotation as R
+
+    anchor_path = "/World/spawned_objects/pose_anchor"
+    anchor_prim = UsdGeom.Xform.Define(stage, anchor_path).GetPrim()
+
+    # Make the anchor a kinematic rigid body (no gravity, no forces).
+    rb_api = UsdPhysics.RigidBodyAPI.Apply(anchor_prim)
+    rb_api.CreateRigidBodyEnabledAttr(True)
+    rb_api.CreateKinematicEnabledAttr(True)
+    try:
+        physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(anchor_prim)
+        physx_rb.CreateDisableGravityAttr(True)
+    except Exception:
+        pass
+
+    # Place anchor at the initial pose.
+    pos = initial_pose[:3, 3]
+    eul_xyz_deg = R.from_matrix(initial_pose[:3, :3]).as_euler("XYZ", degrees=True)
+    xform_api = UsdGeom.XformCommonAPI(anchor_prim)
+    xform_api.SetTranslate(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+    xform_api.SetRotate(
+        Gf.Vec3f(float(eul_xyz_deg[0]), float(eul_xyz_deg[1]), float(eul_xyz_deg[2])),
+        UsdGeom.XformCommonAPI.RotationOrderXYZ,
+    )
+
+    # Create D6 joint connecting anchor (body0) -> dynamic object (body1).
+    joint_path = "/World/spawned_objects/d6_joint"
+    joint = UsdPhysics.Joint.Define(stage, joint_path)
+    joint.CreateBody0Rel().SetTargets([anchor_path])
+    joint.CreateBody1Rel().SetTargets([object_prim_path])
+
+    # Configure spring-damper drives on all 6 DOFs.
+    joint_prim = joint.GetPrim()
+    for axis in ("transX", "transY", "transZ", "rotX", "rotY", "rotZ"):
+        drive = UsdPhysics.DriveAPI.Apply(joint_prim, axis)
+        drive.CreateTypeAttr("force")
+        drive.CreateStiffnessAttr(stiffness)
+        drive.CreateDampingAttr(damping)
+        drive.CreateTargetPositionAttr(0.0)
+
+    print(
+        f"[d6] Created tracking joint: {anchor_path} -> {object_prim_path} "
+        f"(Kp={stiffness}, Kd={damping})"
+    )
+    return anchor_path
+
+
+def filter_collision_pair(stage, prim_path_a: str, prim_path_b: str) -> None:
+    """Disable collision between two prims (and their descendants).
+
+    Uses ``UsdPhysics.FilteredPairsAPI`` so the rest of the scene's collision
+    behaviour is unchanged. Useful for replaying trajectories where two bodies
+    intentionally interpenetrate (e.g. robot hand passing through a kinematic
+    object whose pose came from an offline 6D estimator).
+    """
+    prim_a = stage.GetPrimAtPath(prim_path_a)
+    if not prim_a.IsValid():
+        print(f"[collision] WARNING: {prim_path_a} not found in stage")
+        return
+
+    api = UsdPhysics.FilteredPairsAPI.Apply(prim_a)
+    rel = api.CreateFilteredPairsRel()
+    rel.AddTarget(Sdf.Path(prim_path_b))
+    print(f"[collision] Filtered collision pair: {prim_path_a} <-> {prim_path_b}")
+
+
+# ── Internal helpers ────────────────────────────────────────────────────────
+
+
+def _setup_rigid_body(root_prim: Usd.Prim, *, kinematic: bool) -> None:
+    """Apply rigid-body + collision APIs.
+
+    For kinematic bodies, gravity is disabled and the kinematic flag is set,
+    so PhysX follows externally-prescribed transforms instead of integrating
+    forces. The object can still collide with other dynamic bodies (e.g. the
+    table) — kinematic bodies push dynamics but ignore forces themselves.
+    """
     rb_api = UsdPhysics.RigidBodyAPI.Apply(root_prim)
     rb_api.CreateRigidBodyEnabledAttr(True)
+    if kinematic:
+        rb_api.CreateKinematicEnabledAttr(True)
 
     try:
         physx_rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(root_prim)
-        physx_rb_api.CreateDisableGravityAttr(False)
+        physx_rb_api.CreateDisableGravityAttr(kinematic)
     except Exception:
         pass
 

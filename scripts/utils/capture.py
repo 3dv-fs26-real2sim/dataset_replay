@@ -3,10 +3,10 @@
 Depends on imageio, numpy, and Isaac Sim viewport utilities (deferred import).
 Must be imported after SimulationApp is created.
 """
+# TODO: Recording is very slow and laggy. Investigate better methods if available.
 
 import asyncio
 import ctypes
-import importlib
 import inspect
 from pathlib import Path
 
@@ -14,17 +14,79 @@ import numpy as np
 import imageio.v2 as imageio
 
 
+def setup_recording(
+    args,
+    h5_path,
+    n_frames: int,
+    video_suffix: str,
+    app_width: int,
+    app_height: int,
+):
+    """Configure video recorders based on CLI flags.
+
+    This is a high-level helper that wires up ``setup_capture`` and
+    ``setup_sidebyside`` according to the recording-related argparse flags
+    (``--record-sim``, ``--record-comparison``, ``--no-fast-record``,
+    ``--h5-camera``).
+
+    Args:
+        args: Parsed CLI args (must have ``record_sim``, ``record_comparison``,
+            ``no_fast_record``, ``h5_camera``, ``fps`` attributes).
+        h5_path: ``Path`` to the H5 file (used for output naming and sbs source).
+        n_frames: Total frame count.
+        video_suffix: Descriptive suffix appended to output filenames
+            (e.g. ``"qpos_duck"``).
+        app_width: Render width in pixels.
+        app_height: Render height in pixels.
+
+    Returns:
+        ``(recorder, sim_output_path, sbs_recorder, sbs_output_path)``.
+    """
+    from .constants import OUTPUT_DIR
+
+    needs_viewport_capture = args.record_sim or args.record_comparison
+    deferred = not args.no_fast_record
+
+    recorder, sim_output_path = (None, None)
+    if needs_viewport_capture:
+        if args.record_sim:
+            video_name = f"{h5_path.stem}_replay_{video_suffix}.mp4"
+            sim_output_path = OUTPUT_DIR / video_name
+        else:
+            sim_output_path = None  # memory-only capture for sbs
+        recorder, sim_output_path = setup_capture(
+            n_frames, sim_output_path,
+            args.fps, app_width, app_height, deferred=deferred,
+        )
+
+    sbs_recorder, sbs_output_path = (None, None)
+    if args.record_comparison:
+        sbs_name = f"{h5_path.stem}_comparison_{video_suffix}.mp4"
+        sbs_recorder, sbs_output_path = setup_sidebyside(
+            n_frames, OUTPUT_DIR / sbs_name,
+            args.fps, app_width, app_height, h5_path, args.h5_camera,
+        )
+
+    if not needs_viewport_capture:
+        print("[capture] No recording flags set.")
+
+    return recorder, sim_output_path, sbs_recorder, sbs_output_path
+
+
 def setup_capture(
     total_frames: int,
-    output_path: Path,
+    output_path: Path | None,
     fps: float,
     width: int = 1280,
     height: int = 720,
     deferred: bool = True,
 ):
-    """Configure imageio writer and viewport access for in-memory video capture.
+    """Configure viewport access for frame capture, optionally writing to MP4.
 
     Args:
+        output_path: Path for the MP4 file.  Pass ``None`` to capture frames
+            into memory only (useful when frames are needed for side-by-side
+            composition but no standalone video is desired).
         deferred: If True (default), buffer frames in memory and encode after the
             loop finishes.  Faster replay but uses more RAM.  Set to False for
             inline per-frame encoding (slower but low memory).
@@ -32,7 +94,8 @@ def setup_capture(
     Returns:
         (recorder_dict, output_path) or (None, None) if capture is unavailable.
     """
-    viewport_utility = _import_viewport_utility_module()
+    from .viewport import get_viewport_utility
+    viewport_utility = get_viewport_utility()
     if viewport_utility is None:
         print("[capture] Recording disabled: 'omni.kit.viewport.utility' is unavailable.")
         return None, None
@@ -42,11 +105,14 @@ def setup_capture(
         print("[capture] Recording disabled: no active viewport found.")
         return None, None
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    writer = imageio.get_writer(str(output_path), fps=max(1, int(round(fps))), codec="libx264")
-    mode = "deferred" if deferred else "inline"
-    print(f"[capture] Recording replay to {output_path} via imageio ({total_frames} frames target, {mode} encoding)")
+    writer = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = imageio.get_writer(str(output_path), fps=max(1, int(round(fps))), codec="libx264")
+        mode = "deferred" if deferred else "inline"
+        print(f"[capture] Recording replay to {output_path} via imageio ({total_frames} frames target, {mode} encoding)")
+    else:
+        print(f"[capture] Viewport capture enabled (memory only, {total_frames} frames target)")
 
     return {
         "writer": writer,
@@ -57,7 +123,6 @@ def setup_capture(
         "height": height,
         "frames_written": 0,
         "failed_frames": 0,
-        "logged_meta": False,
         "deferred": deferred,
         "frames": [],
         "last_frame": None,
@@ -71,12 +136,6 @@ def capture_frame_to_writer(recorder, simulation_app) -> bool:
     def on_capture(*cb_args, **cb_kwargs):
         # ByteCapture callback signature: (buffer, buffer_size, width, height, byte_format)
         if len(cb_args) >= 5:
-            if not recorder["logged_meta"]:
-                recorder["logged_meta"] = True
-                print(
-                    f"[capture] Callback meta: size={int(cb_args[1])} "
-                    f"w={int(cb_args[2])} h={int(cb_args[3])} format={cb_args[4]}"
-                )
             raw = _buffer_to_numpy_1d(cb_args[0], int(cb_args[1]))
             if raw is not None:
                 decoded = _decode_raw_with_dims(raw, int(cb_args[2]), int(cb_args[3]))
@@ -132,16 +191,16 @@ def capture_frame_to_writer(recorder, simulation_app) -> bool:
         recorder["failed_frames"] += 1
         if recorder["failed_frames"] <= 3:
             print(
-                "[capture] Warning: frame capture callback returned no decodable image "
-                f"(buffer_type={type(cb_args[0]).__name__ if cb_args else 'unknown'})."
+                "[capture] Warning: frame capture callback returned no decodable image."
             )
         return False
 
     recorder["last_frame"] = frame
-    if recorder["deferred"]:
-        recorder["frames"].append(frame)
-    else:
-        recorder["writer"].append_data(frame)
+    if recorder["writer"] is not None:
+        if recorder["deferred"]:
+            recorder["frames"].append(frame)
+        else:
+            recorder["writer"].append_data(frame)
     recorder["frames_written"] += 1
     return True
 
@@ -150,51 +209,10 @@ def close_recorder(recorder) -> None:
     """Encode any deferred frames and close the video writer."""
     if recorder is None:
         return
-    _encode_deferred_frames(recorder)
-    recorder["writer"].close()
+    if recorder["writer"] is not None:
+        _encode_deferred_frames(recorder)
+        recorder["writer"].close()
 
-
-# ── H5 video export ──────────────────────────────────────────────────────────
-
-
-def export_h5_video(h5_path, camera_name: str, output_path: Path, fps: float):
-    """Extract RGB images from an H5 file and write them to MP4.
-
-    Returns:
-        (output_path, n_frames) on success, (None, 0) if camera data not found.
-    """
-    import h5py
-    from .constants import H5_IMAGE_PATHS
-
-    ds_path = H5_IMAGE_PATHS.get(camera_name)
-    if ds_path is None:
-        print(f"[h5-video] Unknown camera '{camera_name}'. "
-              f"Available: {list(H5_IMAGE_PATHS.keys())}")
-        return None, 0
-
-    with h5py.File(h5_path, "r") as f:
-        if ds_path not in f:
-            print(f"[h5-video] Camera '{camera_name}' ({ds_path}) not found in {h5_path}")
-            return None, 0
-
-        ds = f[ds_path]
-        n_frames = ds.shape[0]
-        print(f"[h5-video] Exporting {n_frames} frames from '{camera_name}' "
-              f"({ds.shape[1]}x{ds.shape[2]}) to {output_path}")
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        writer = imageio.get_writer(
-            str(output_path), fps=max(1, int(round(fps))), codec="libx264",
-        )
-
-        for i in range(n_frames):
-            writer.append_data(ds[i])
-            if (i + 1) % 200 == 0:
-                print(f"  [h5-video] {i + 1}/{n_frames}")
-
-        writer.close()
-        print(f"[h5-video] Done: {output_path}")
-        return output_path, n_frames
 
 
 # ── Side-by-side (comparison) capture ────────────────────────────────────────
@@ -310,26 +328,6 @@ def _resize_to_height(frame, target_height: int, target_width: int = 0):
     sx = target_width / w
     return zoom(frame, (sy, sx, 1), order=1).astype(np.uint8)
 
-
-def _import_viewport_utility_module():
-    """Import viewport utility module, enabling extension first if needed."""
-    try:
-        return importlib.import_module("omni.kit.viewport.utility")
-    except ModuleNotFoundError:
-        pass
-
-    try:
-        app = importlib.import_module("omni.kit.app")
-        ext_manager = app.get_app().get_extension_manager()
-        ext_manager.set_extension_enabled_immediate("omni.kit.viewport.utility", True)
-    except Exception as exc:
-        print(f"[capture] Could not enable omni.kit.viewport.utility extension: {exc}")
-        return None
-
-    try:
-        return importlib.import_module("omni.kit.viewport.utility")
-    except ModuleNotFoundError:
-        return None
 
 
 def _decode_capture_frame(payload) -> np.ndarray | None:

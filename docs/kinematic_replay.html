@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>test_replay.py — Dataset Replay Script Documentation</title>
+<title>kinematic_replay.py — Kinematic Replay Script Documentation</title>
 <style>
   :root { --bg: #fafafa; --fg: #222; --accent: #2563eb; --code-bg: #f0f0f0; --border: #ddd; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -33,8 +33,8 @@
 </head>
 <body>
 
-<h1>test_replay.py</h1>
-<p>Replays recorded robot arm and hand trajectories from HDF5 files in NVIDIA Isaac Sim using inverse kinematics.</p>
+<h1>kinematic_replay.py</h1>
+<p>Kinematic replay of recorded robot arm and hand trajectories from HDF5 files in NVIDIA Isaac Sim using inverse kinematics. The object follows the 6D pose trajectory exactly as a kinematic rigid body (no physics forces). For physics-based replay with spring-damper tracking, see <code>dynamic_replay.py</code> and <a href="dynamic_replay_strategy.html">Dynamic Replay Strategy</a>.</p>
 
 <nav>
 <strong>Contents</strong>
@@ -47,6 +47,7 @@
   <li><a href="#lula-yaml">Lula Robot Descriptor YAML</a></li>
   <li><a href="#ik-solver">IK Solver</a></li>
   <li><a href="#camera-setup">Camera Setup</a></li>
+  <li><a href="#object-replay">Object 6D Pose Replay</a></li>
   <li><a href="#functions">Function-by-Function Reference</a></li>
   <li><a href="#main-function">The main() Function</a></li>
   <li><a href="#video-capture">Video Capture System</a></li>
@@ -85,22 +86,18 @@
   <li><strong>Load h5 data</strong> &mdash; read arm wrist poses and hand joint angles from the HDF5 file.</li>
   <li><strong>Detect quaternion ordering</strong> &mdash; auto-detect whether the h5 quaternions are wxyz or xyzw and reorder to wxyz if needed. The IK solver requires wxyz (scalar-first).</li>
   <li><strong>Open USD stage</strong> &mdash; load the pre-built scene containing the robot(s) and environment.</li>
-  <li><strong>Create World and articulations</strong> &mdash; Isaac Sim's physics world, with one or two <code>SingleArticulation</code> objects wrapping the robot prims. If <code>--no-collision</code> is set, collision is disabled on the table (<code>/World/Cube</code>).</li>
+  <li><strong>Create World and add articulations</strong> &mdash; Isaac Sim's physics world, with one or two <code>SingleArticulation</code> objects wrapping the robot prims (<code>utils.robot.add_articulations()</code>). <code>world.reset()</code> initializes them.</li>
+  <li><strong>Set up arms via IK</strong> &mdash; for each active arm side (right always, left in dual mode), create an IK solver, compute home arm joints, resolve DOF indices, set the home pose, and build a per-frame position setter closure (<code>utils.robot.setup_arms_ik()</code>). This loop replaces per-side if/else blocks.</li>
+  <li><strong>Spawn the trajectory-driven object</strong> (single mode only) &mdash; load the chosen object's 6D pose trajectory <code>.npz</code>, transform it from camera frame to world frame, and spawn the OBJ as a kinematic rigid body at the first pose. See <a href="#object-replay">Object 6D Pose Replay</a>.</li>
   <li><strong>Set up calibrated camera</strong> (if <code>--camera</code>) &mdash; compute the camera world pose from extrinsics and robot base transforms, create a USD camera prim, and set it as the active viewport. See <a href="#camera-setup">Camera Setup</a>.</li>
-  <li><strong>Create IK solvers</strong> &mdash; one per arm side (different URDFs for left/right because the EE frames are in the hand portion).</li>
-  <li><strong>Compute home arm pose via IK</strong> &mdash; solve for joint angles that achieve <code>WRIST_HOME_POSITION</code> + <code>WRIST_HOME_ROTATION</code>.</li>
-  <li><strong>Resolve DOF indices</strong> &mdash; map canonical joint names (e.g. <code>panda_joint1</code>) to the articulation's internal DOF array indices.</li>
-  <li><strong>Set home joint positions</strong> &mdash; write the IK-computed arm joints and zero hand joints to the articulation.</li>
-  <li><strong>Create position setters</strong> &mdash; closures that, per frame, solve IK for the arm and set all joint positions.</li>
-  <li><strong>Hold home pose</strong> &mdash; render the home pose for a few seconds so the viewer can see it.</li>
-  <li><strong>Replay loop</strong> &mdash; for each frame, call the position setter with the h5 wrist pose and hand joints, step physics, optionally capture video.</li>
+  <li><strong>Replay loop</strong> &mdash; for each frame, call the position setter for each arm with the h5 wrist pose and hand joints, push the per-frame world-frame object pose (if any), step physics, optionally capture video.</li>
   <li><strong>Report and cleanup</strong> &mdash; print IK failure stats, close video writer, close SimulationApp.</li>
 </ol>
 
 
 <!-- ======================================================================= -->
 <h2 id="import-structure">Import Structure</h2>
-<p>The script is organized into a thin orchestration layer (<code>test_replay.py</code>) that imports
+<p>The script is organized into a thin orchestration layer (<code>kinematic_replay.py</code>) that imports
 reusable utilities from <code>scripts/utils/</code>. Imports are split into two groups,
 separated by <code>SimulationApp</code> construction:</p>
 
@@ -112,18 +109,18 @@ separated by <code>SimulationApp</code> construction:</p>
 <h3>After SimulationApp</h3>
 <p>Everything that depends on the Omniverse runtime, imported from <code>utils/</code> modules:</p>
 <ul>
-  <li><code>utils.constants</code> &mdash; all shared constants (paths, joint names, home poses, IK config)</li>
-  <li><code>utils.rotation</code> &mdash; quaternion math (<code>rotation_matrix_to_wxyz</code>, <code>detect_quaternion_order</code>, <code>tool_quat_to_urdf</code>)</li>
+  <li><code>utils.constants</code> &mdash; shared constants (prim paths, object directories)</li>
+  <li><code>utils.rotation</code> &mdash; <code>detect_quaternion_order()</code> for auto-detecting wxyz vs xyzw</li>
   <li><code>utils.h5_loader</code> &mdash; HDF5 trajectory loading</li>
-  <li><code>utils.robot</code> &mdash; articulation setup, DOF resolution, collision control</li>
-  <li><code>utils.ik</code> &mdash; IK solver creation, solving, position-setter factory</li>
-  <li><code>utils.capture</code> &mdash; viewport video capture pipeline</li>
-  <li><code>utils.camera</code> &mdash; camera setup from calibration extrinsics/intrinsics</li>
+  <li><code>utils.robot</code> &mdash; <code>add_articulations()</code> and <code>setup_arms_ik()</code> (internally uses <code>utils.ik</code> for IK solving)</li>
+  <li><code>utils.capture</code> &mdash; <code>setup_recording()</code> (high-level entry point), plus <code>capture_frame_to_writer()</code>, <code>close_recorder()</code>, <code>capture_sidebyside_frame()</code>, <code>close_sidebyside()</code></li>
+  <li><code>utils.camera</code> &mdash; <code>setup_camera()</code> from calibration extrinsics/intrinsics</li>
+  <li><code>utils.object</code> &mdash; <code>load_object_world_trajectory()</code> (internally uses <code>utils.poses</code> and <code>utils.camera</code>), <code>spawn_object()</code>, <code>set_object_world_pose()</code></li>
 </ul>
 <p>Modules without Isaac Sim dependencies (<code>constants</code>, <code>rotation</code>,
-<code>h5_loader</code>) are safe to import at any time. Modules with Isaac Sim dependencies
-(<code>robot</code>, <code>ik</code>, <code>capture</code>, <code>camera</code>, <code>object</code>) must be
-imported after <code>create_app()</code> returns.</p>
+<code>h5_loader</code>, <code>poses</code>) are safe to import at any time. Modules with Isaac Sim
+dependencies (<code>robot</code>, <code>ik</code>, <code>capture</code>, <code>camera</code>, <code>object</code>)
+must be imported after <code>create_app()</code> returns.</p>
 <div class="warn">
   If you import <code>omni.*</code> or <code>isaacsim.core.*</code> before constructing <code>SimulationApp</code>,
   the import will fail with a cryptic error. This is an Isaac Sim requirement.
@@ -186,7 +183,7 @@ the IK target is shifted from the EE wrist position to the <code>fer_link8</code
 <pre><code>ik_position = ee_wrist_pos - R_fer_link8 @ EE_WRIST_OFFSET_IN_LINK8</code></pre>
 <p>This is applied in two places:</p>
 <ol>
-  <li><strong>Home pose</strong> &mdash; <code>test_replay.py</code> computes <code>home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8</code> before calling <code>solve_ik_for_pose()</code>.</li>
+  <li><strong>Home pose</strong> &mdash; <code>kinematic_replay.py</code> computes <code>home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8</code> before calling <code>solve_ik_for_pose()</code>.</li>
   <li><strong>Per-frame replay</strong> &mdash; <code>make_ik_position_setter()</code> accepts <code>ee_wrist_offset</code> and applies the same shift inside <code>set_positions()</code> using the per-frame URDF-convention orientation.</li>
 </ol>
 
@@ -421,7 +418,7 @@ additional cameras (e.g., OAK-D) by adding entries to <code>CAMERA_CONFIGS</code
   <li><strong>USD camera creation</strong> &mdash; a <code>UsdGeom.Camera</code> prim is created at
       <code>/World/{Name}Camera</code> with the computed pose and pinhole intrinsics.</li>
   <li><strong>Viewport activation</strong> &mdash; the new camera is set as the active viewport camera.
-      Video capture (<code>--record</code>) automatically uses whatever camera is active.</li>
+      Video capture (<code>--record-sim</code> / <code>--record-comparison</code>) automatically uses whatever camera is active.</li>
 </ol>
 
 <h3>CV &harr; USD Camera Convention</h3>
@@ -432,15 +429,14 @@ look along <strong>&minus;Z</strong>. A 180&deg; rotation around X
 <h3>Intrinsics</h3>
 <p>Pinhole parameters (<code>fx</code>, <code>fy</code>, <code>cx</code>, <code>cy</code>) are mapped to
 USD camera attributes (<code>focalLength</code>, <code>horizontalAperture</code>,
-<code>verticalAperture</code>, aperture offsets). The current Aria intrinsics are <strong>placeholders</strong>
-&mdash; update <code>ARIA_INTRINSICS</code> in <code>constants.py</code> once exact calibration values are available.</p>
+<code>verticalAperture</code>, aperture offsets). The Aria intrinsics are derived from calibrated focal length values (see <code>constants.py</code> comments).</p>
 
 <h3>Adding a New Camera</h3>
 <p>To add a new camera (e.g., OAK-D):</p>
 <ol>
   <li>Define <code>OAKD_EXTRINSICS</code> and <code>OAKD_INTRINSICS</code> in <code>constants.py</code>.</li>
   <li>Add an <code>"oakd"</code> entry to <code>CAMERA_CONFIGS</code>.</li>
-  <li>Add <code>"oakd"</code> to the <code>--camera</code> choices list in <code>test_replay.py</code>.</li>
+  <li>Add <code>"oakd"</code> to the <code>--camera</code> choices list in <code>kinematic_replay.py</code>.</li>
 </ol>
 
 <h3>Camera Module Functions (<code>utils/camera.py</code>)</h3>
@@ -452,6 +448,93 @@ USD camera attributes (<code>focalLength</code>, <code>horizontalAperture</code>
   <tr><td><code>create_camera_prim()</code></td><td>Creates a <code>UsdGeom.Camera</code> with pose and intrinsics.</td></tr>
   <tr><td><code>set_viewport_camera()</code></td><td>Sets the active viewport to render from the given camera.</td></tr>
 </table>
+
+
+<!-- ======================================================================= -->
+<h2 id="object-replay">Object 6D Pose Replay</h2>
+<p>
+  In addition to replaying robot motion from H5 data, <code>kinematic_replay.py</code> can spawn a
+  scene object (e.g. the duck being picked up in the single-arm dataset) and animate it along a
+  pre-computed <strong>6D pose trajectory</strong>. The trajectory is stored as an
+  <code>.npz</code> file containing a single <code>(N, 4, 4)</code> array of homogeneous
+  transformation matrices, typically generated by an external 6D pose estimator
+  (e.g. FoundationPose / VideoDepthAnything) running on the dataset's camera images.
+</p>
+
+<h3>Why kinematic, not dynamic?</h3>
+<p>
+  The object is spawned as a <strong>kinematic</strong> rigid body: PhysX disables gravity on
+  it and follows the prescribed per-frame pose instead of integrating forces. This is the right
+  choice for trajectory replay &mdash; we want the object to track the externally-estimated
+  motion exactly, regardless of how the simulated robot interacts with it. Kinematic bodies
+  still <em>push</em> dynamic bodies on contact, so the rest of the scene physics still
+  responds correctly.
+</p>
+
+<h3>Coordinate frame: camera &rarr; world</h3>
+<p>
+  The pose <code>.npz</code> stores transforms <strong>in the camera frame</strong>
+  (the camera that captured the images the estimator ran on). At spawn time the script
+  computes the camera's world pose from its calibrated extrinsics and the robot base prim
+  transforms (the same logic that powers <code>--camera</code> &mdash; see
+  <a href="#camera-setup">Camera Setup</a>), then transforms every frame:
+</p>
+<pre><code>T_world_obj[i] = T_world_cam @ T_cam_obj[i]</code></pre>
+<p>
+  In single mode, only the right arm's extrinsic is used (there is no left arm to average
+  with). The <code>--object-pose-camera</code> flag selects which calibrated camera the
+  trajectory was generated against (defaults to <code>aria</code>, the camera the bundled
+  duck dataset uses).
+</p>
+
+<h3>Per-frame replay</h3>
+<p>
+  Inside the replay loop, after pushing the H5 wrist poses to the IK setters, the script
+  calls <code>set_object_world_pose(stage, prim_path, T_world_obj[frame_idx])</code>, which
+  writes the new translation and XYZ-Euler rotation to the prim via
+  <code>UsdGeom.XformCommonAPI</code>. The original spawn-time scale is preserved.
+  If the trajectory has fewer frames than the H5 dataset, the object stops updating once the
+  trajectory runs out (the robot continues replaying). The script prints a warning if the
+  frame counts mismatch.
+</p>
+
+<h3>Default object &amp; supported types</h3>
+<p>
+  The default object is <code>duck</code>, with the trajectory loaded from
+  <code>data/poses_duck_vda.npz</code> (mapped via <code>OBJECT_POSE_PATHS</code> in
+  <code>constants.py</code>). The full set of supported object meshes (<code>OBJECT_CHOICES</code>):
+  <code>ball</code>, <code>duck</code>, <code>fish</code>,
+  <code>grape</code>, <code>shovel</code>. Pass <code>--object none</code> to skip object
+  spawning entirely.
+</p>
+<p>
+  To add a new object trajectory, drop the <code>.npz</code> in <code>dataset_replay/data/</code>
+  and add an entry to <code>OBJECT_POSE_PATHS</code> in <code>constants.py</code>. Or, for a
+  one-off run, pass <code>--object-poses path/to/file.npz</code> to override the lookup.
+</p>
+
+<h3>Mode restrictions</h3>
+<p>
+  Object spawning is currently <strong>only honoured in <code>--mode single</code></strong>,
+  because the bundled duck trajectory was generated against the single-arm dataset
+  (<code>20250804_104715.h5</code>, 1199 frames). In dual mode the script logs a notice and
+  skips object spawning. To enable a different object/dataset combination, supply both
+  <code>--object-poses</code> and an appropriately-aligned H5 file.
+</p>
+
+<h3>Pose <code>.npz</code> format</h3>
+<table>
+  <tr><th>Property</th><th>Value</th></tr>
+  <tr><td>Number of arrays</td><td>1 (the array name is irrelevant; <code>load_pose_trajectory()</code> picks the only key)</td></tr>
+  <tr><td>Shape</td><td><code>(N, 4, 4)</code></td></tr>
+  <tr><td>dtype</td><td>any numeric (loaded as <code>float64</code>)</td></tr>
+  <tr><td>Frame</td><td>Camera frame matching <code>--object-pose-camera</code></td></tr>
+  <tr><td>Frame count</td><td>Should match the H5 dataset frame count for 1:1 alignment</td></tr>
+</table>
+<p>
+  The bundled <code>poses_duck_vda.npz</code> has shape <code>(1199, 4, 4)</code>, exactly
+  matching <code>20250804_104715.h5</code>.
+</p>
 
 
 <!-- ======================================================================= -->
@@ -506,9 +589,64 @@ matching strategies in order:</p>
 </ol>
 <p>Returns a numpy array of integer indices that can be used to slice into <code>art.get_joint_positions()</code>.</p>
 
-<h3><code>utils.robot.</code><code class="fn">set_collision_enabled</code>(stage, prim_path, enabled)</h3>
-<p>Enables or disables collision on a USD prim. Used by <code>test_replay.py</code> with <code>--no-collision</code>
-to disable the table collision.</p>
+
+<h3><code>utils.poses.</code><code class="fn">load_pose_trajectory</code>(npz_path)</h3>
+<p>Loads a single <code>(N, 4, 4)</code> array of homogeneous transforms from a <code>.npz</code>
+file. Validates the shape and returns <code>float64</code>. Raises <code>FileNotFoundError</code>
+if the path is missing or <code>ValueError</code> if the file shape is wrong.</p>
+
+<h3><code>utils.poses.</code><code class="fn">transform_trajectory</code>(T_target_from_source, traj_source)</h3>
+<p>Re-expresses a <code>(N, 4, 4)</code> trajectory in a different reference frame by
+left-multiplying every pose by a 4&times;4 transform. Used to convert the camera-frame
+object pose trajectory into the world frame:
+<code>T_world_obj[i] = T_world_cam @ T_cam_obj[i]</code>. Implemented as a single
+<code>np.einsum</code> call for efficiency.</p>
+
+<h3><code>utils.poses.</code><code class="fn">translation_matrix</code>(t)</h3>
+<p>Builds a 4&times;4 homogeneous translation matrix from a 3-vector. Shared utility used by
+<code>camera.py</code> and <code>calculate_table_depth.py</code>.</p>
+
+<h3><code>utils.poses.</code><code class="fn">average_poses</code>(poses)</h3>
+<p>Averages multiple 4&times;4 poses: arithmetic mean of positions, rotation mean via
+<code>scipy.spatial.transform.Rotation.mean()</code>. Used by <code>camera.py</code>
+(dual-mode camera averaging) and <code>calculate_table_depth.py</code>.</p>
+
+<h3><code>utils.viewport.</code><code class="fn">get_viewport_utility</code>()</h3>
+<p>Imports and returns <code>omni.kit.viewport.utility</code>, auto-enabling the extension if
+needed. Returns <code>None</code> if the module is unavailable. Shared by <code>camera.py</code>
+and <code>capture.py</code> to avoid duplicate import logic.</p>
+
+<h3><code>utils.object.</code><code class="fn">spawn_object</code>(stage, object_name, position, scale, objects_dir, *, kinematic=False)</h3>
+<p>Spawns an OBJ mesh from <code>objects_dir/&lt;object_name&gt;/&lt;object_name&gt;.obj</code> as a child
+of <code>/World/spawned_objects</code>, with rigid-body and convex-hull collision applied to every
+<code>UsdGeom.Mesh</code> descendant. When <code>kinematic=True</code>, the rigid body is set
+kinematic and gravity is disabled &mdash; the body will follow externally-prescribed transforms
+written via <code>set_object_world_pose()</code>. Returns the prim path of the spawned instance.</p>
+
+<h3><code>utils.object.</code><code class="fn">set_object_world_pose</code>(stage, prim_path, T_world_obj)</h3>
+<p>Updates the translation and rotation of a spawned object from a 4&times;4 transform.
+The rotation is converted to XYZ-Euler degrees via <code>scipy.spatial.transform.Rotation</code>
+and pushed through <code>UsdGeom.XformCommonAPI</code>. The spawn-time scale is preserved.
+Designed to be called once per replay frame for kinematic trajectory replay.</p>
+
+<h3><code>utils.object.</code><code class="fn">create_d6_tracking_joint</code>(stage, object_prim_path, initial_pose, stiffness, damping)</h3>
+<p>Creates a kinematic anchor and D6 joint with spring-damper drives connecting the anchor
+to a dynamic rigid body. The anchor follows the estimated trajectory each frame (via
+<code>set_object_world_pose()</code>); the joint drives pull the dynamic object toward the
+anchor while PhysX resolves collisions, gravity, and contact forces. Used by
+<code>dynamic_replay.py</code>. Returns the anchor prim path.</p>
+
+<h3><code>utils.object.</code><code class="fn">filter_collision_pair</code>(stage, prim_path_a, prim_path_b)</h3>
+<p>Disables collision between two prims (and their descendants) by applying
+<code>UsdPhysics.FilteredPairsAPI</code> to <code>prim_path_a</code> and adding
+<code>prim_path_b</code> to its filtered-pairs relationship. The rest of the scene's collision
+behaviour is unchanged.</p>
+
+<h3><code>utils.camera.</code><code class="fn">compute_camera_world_pose</code>(stage, extrinsics, left_prim_path, right_prim_path)</h3>
+<p>Reads the world pose of each robot base from the USD stage and returns a 4&times;4 camera world
+pose. In dual mode the per-arm results are averaged; in single mode (<code>left_prim_path=None</code>)
+only the right arm is used. Re-used by the object trajectory pipeline to convert camera-frame
+poses into world frame.</p>
 
 <h3><code>utils.h5_loader.</code><code class="fn">load_h5</code>(path, use_actions, mode)</h3>
 <p>Loads all arm and hand datasets from the h5 file. In dual mode, loads left and right separately.
@@ -542,7 +680,7 @@ setup state and is called once per frame during replay.</p>
 
 <!-- ======================================================================= -->
 <h2 id="main-function">The main() Function</h2>
-<p>Detailed walkthrough of <code>main()</code> in <code>test_replay.py</code>:</p>
+<p>Detailed walkthrough of <code>main()</code> in <code>kinematic_replay.py</code>:</p>
 
 <h3>Step 1: Load and validate data</h3>
 <pre><code>data = load_h5(h5_path, args.use_actions, args.mode)
@@ -551,103 +689,62 @@ data["arm_right"] = detect_quaternion_order(data["arm_right"], "arm_right")
 <p>Loads arm wrist poses and hand joint angles from the h5 file. Quaternion ordering is auto-detected
 and reordered to wxyz if needed. The first frame is printed as a diagnostic.</p>
 
-<h3>Step 2: Open scene and create articulations</h3>
-<pre><code>omni.usd.get_context().open_stage(str(USD_PATH))
-world = World()
-franka_right = setup_articulation(FRANKA_RIGHT_PATH, world)
-world.reset()</code></pre>
-<p><code>World()</code> creates the physics simulation. <code>world.reset()</code> initializes all articulations
-to their default state and must be called before reading or writing joint positions.</p>
+<h3>Step 2: Open scene, add articulations, set up arms</h3>
+<pre><code>world = World()
+arms = add_articulations(world, args.mode)    # right always; left in dual
+world.reset()
+setup_arms_ik(arms)                           # IK solvers, home pose, DOFs, setters</code></pre>
+<p><code>add_articulations()</code> (in <code>utils.robot</code>) registers one or two <code>SingleArticulation</code> objects with the
+physics world. <code>world.reset()</code> must be called before joint positions can be read or written.
+Then <code>setup_arms_ik()</code> (in <code>utils.robot</code>) loops over each active arm side, creating an IK solver (different
+URDFs for left/right), computing the IK-based home arm joints, resolving DOF indices,
+setting the home pose, and building a per-frame position setter closure. The per-arm config
+(<code>ARM_CONFIGS</code>) defines prim path, URDF path, EE frame name, and hand joint names per side.</p>
 
-<h3>Step 3: Create IK solvers</h3>
-<pre><code>ik_solver_right = create_ik_solver(URDF_PATH_RIGHT, LULA_DESCRIPTOR_PATH, "right")
-ik_solver_left  = create_ik_solver(URDF_PATH_LEFT, LULA_DESCRIPTOR_PATH, "left")  # dual only</code></pre>
-<p>Two solver instances because the URDFs differ (left vs right hand link names).</p>
-
-<h3>Step 4: Compute home arm joints</h3>
-<pre><code>home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
-home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
-home_arm_joints, _ = solve_ik_for_pose(
-    ik_solver_right, EE_FRAME_NAME_RIGHT,
-    home_fer_link8_pos, home_wrist_quat,
-)
-# In dual mode, a separate home IK is computed for the left arm:
-home_arm_joints_left, _ = solve_ik_for_pose(
-    ik_solver_left, EE_FRAME_NAME_LEFT,
-    home_fer_link8_pos, home_wrist_quat,
-)</code></pre>
 <p><code>WRIST_HOME_POSITION</code> is the desired <strong>EE wrist</strong> location.
 Before passing to the IK solver (which targets <code>fer_link8</code>), the position is shifted
 by <code>EE_WRIST_OFFSET_IN_LINK8</code> rotated into world frame via <code>WRIST_HOME_ROTATION</code>.
 At the nominal home orientation this shifts the IK target from <code>[0.40, 0.0, 0.30]</code>
 to approximately <code>[0.27, 0.0, 0.37]</code>.
-In dual mode, a <strong>separate</strong> home IK is also computed for the left arm using its own
-solver (<code>ik_solver_left</code>). Each arm&rsquo;s home solution is used as the initial warm
-start for its respective IK closure, ensuring the warm-start chain begins in the correct
-configuration for each arm.
-If either IK fails, the script raises a <code>RuntimeError</code> with diagnostic info.</p>
+Each arm&rsquo;s home IK solution is used as the initial warm start for its respective closure.
+If IK fails for any arm, the script raises a <code>RuntimeError</code> with diagnostic info.</p>
 
-<h3>Step 5: Resolve DOF indices and set home positions</h3>
-<p>For each articulation, <code>resolve_dof_indices()</code> maps the canonical joint names to the articulation's
-internal DOF array. Then the IK-computed arm joints and zero hand joints are written directly.</p>
-
-<h3>Step 6: Create position setter closures</h3>
-<pre><code>set_right = make_ik_position_setter(
-    franka_right, arm_idx_right, hand_idx_right,
-    ik_solver_right, EE_FRAME_NAME_RIGHT,
-    HAND_HOME_JOINT_VALUES, home_arm_joints,
-    ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
-)
-# In dual mode, the left arm uses its own home IK solution:
-set_left = make_ik_position_setter(
-    franka_left, arm_idx_left, hand_idx_left,
-    ik_solver_left, EE_FRAME_NAME_LEFT,
-    HAND_HOME_JOINT_VALUES, home_arm_joints_left,
-    ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
-)</code></pre>
-<p>These closures are the per-frame workhorses. Each one captures its own IK solver, DOF indices,
-and warm-start state. The <code>home_arm_joints</code> / <code>home_arm_joints_left</code> argument
-initializes the warm-start chain for each arm independently.</p>
-
-<h3>Step 7: Home hold</h3>
-<p>Runs <code>HOME_HOLD_SECONDS &times; fps</code> simulation steps with the home pose, so the viewer
-can see the starting configuration before replay begins.</p>
-
-<h3>Step 8: Replay loop</h3>
+<h3>Step 3: Replay loop</h3>
 <pre><code>for frame_idx in range(n_frames):
-    set_left(data["arm_left"][frame_idx], data["hand_left"][frame_idx])   # dual only
-    set_right(data["arm_right"][frame_idx], data["hand_right"][frame_idx])
+    for side, arm in arms.items():
+        arm["set_positions"](data[f"arm_{side}"][frame_idx], data[f"hand_{side}"][frame_idx])
     world.step(render=True)</code></pre>
-<p>Each call to <code>set_left</code>/<code>set_right</code> internally solves IK, updates all joints,
-and the <code>world.step(render=True)</code> advances physics and renders the frame.
+<p>Each call to <code>arm["set_positions"]</code> internally solves IK, updates all joints.
+<code>world.step(render=True)</code> advances physics and renders the frame.
 Progress is printed every 100 frames. Ctrl-C cleanly exits the loop.</p>
 
-<h3>Step 9: Report and cleanup</h3>
-<p>IK failure counts are printed per arm. The video writer is closed. <code>simulation_app.close()</code> shuts
+<h3>Step 4: Report and cleanup</h3>
+<p>IK failure counts are printed per arm. Video writers are closed. <code>simulation_app.close()</code> shuts
 down the Omniverse runtime.</p>
 
 
 <!-- ======================================================================= -->
 <h2 id="video-capture">Video Capture System</h2>
-<p>The replay script (<code>test_replay.py</code>) supports two recording modes.
+<p>The replay script (<code>kinematic_replay.py</code>) supports two recording modes.
 A separate standalone script (<code>record_h5.py</code>) handles H5 image extraction without Isaac Sim.
 All capture logic lives in <code>utils/capture.py</code>.</p>
 
 <table>
   <tr><th>Script / Flag</th><th>Output</th><th>Description</th></tr>
-  <tr><td><code>test_replay.py --record-sim</code></td><td><code>&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code></td><td>Record the Isaac Sim viewport to MP4.</td></tr>
-  <tr><td><code>test_replay.py --record-comparison</code></td><td><code>&lt;H5_STEM&gt;_comparison_&lt;SUFFIX&gt;.mp4</code></td><td>Side-by-side: Isaac Sim (left) + H5 original (right).</td></tr>
+  <tr><td><code>kinematic_replay.py --record-sim</code></td><td><code>&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code></td><td>Record the Isaac Sim viewport to MP4.</td></tr>
+  <tr><td><code>kinematic_replay.py --record-comparison</code></td><td><code>&lt;H5_STEM&gt;_comparison_&lt;SUFFIX&gt;.mp4</code></td><td>Side-by-side: Isaac Sim (left) + H5 original (right).</td></tr>
   <tr><td><code>record_h5.py</code></td><td><code>&lt;H5_STEM&gt;_&lt;CAMERA&gt;.mp4</code></td><td>Extract original camera images from H5 to MP4 (no GPU needed).</td></tr>
 </table>
 
 <h3>Video Naming Convention</h3>
-<p>Output filenames include a descriptive suffix built from the active flags:</p>
+<p>Output filenames include a descriptive suffix built from the active flags. The
+object name is included only in single mode (where the object is actually spawned):</p>
 <ul>
-  <li><code>&lt;H5_STEM&gt;_replay_qpos.mp4</code> &mdash; default (observations/qpos data, collision enabled)</li>
-  <li><code>&lt;H5_STEM&gt;_replay_actions.mp4</code> &mdash; <code>--use-actions</code></li>
-  <li><code>&lt;H5_STEM&gt;_replay_qpos_nocol.mp4</code> &mdash; <code>--no-collision</code></li>
-  <li><code>&lt;H5_STEM&gt;_replay_actions_nocol.mp4</code> &mdash; <code>--use-actions --no-collision</code></li>
-  <li><code>&lt;H5_STEM&gt;_comparison_qpos.mp4</code> &mdash; side-by-side with defaults</li>
+  <li><code>&lt;H5_STEM&gt;_replay_qpos_duck.mp4</code> &mdash; default single mode with duck (observations/qpos data)</li>
+  <li><code>&lt;H5_STEM&gt;_replay_actions.mp4</code> &mdash; dual mode + <code>--use-actions</code></li>
+  <li><code>&lt;H5_STEM&gt;_replay_qpos_duck.mp4</code> &mdash; single mode with default duck object</li>
+  <li><code>&lt;H5_STEM&gt;_replay_actions_duck.mp4</code> &mdash; <code>--use-actions</code> + duck</li>
+  <li><code>&lt;H5_STEM&gt;_comparison_qpos_duck.mp4</code> &mdash; side-by-side with single-mode defaults</li>
 </ul>
 
 <h3>Deferred Encoding (Fast Record)</h3>
@@ -719,7 +816,6 @@ concatenation.</p>
   <li><code>capture_sidebyside_frame(recorder, sim_frame, frame_idx)</code> &mdash; reads the H5 frame, optionally resizes, concatenates, and buffers.</li>
   <li><code>close_sidebyside(recorder)</code> &mdash; encodes deferred frames and closes the writer + H5 file.</li>
 </ul>
-<p>During hold frames (home pose), the first H5 image is used as a frozen placeholder.</p>
 
 
 <!-- ======================================================================= -->
@@ -727,12 +823,15 @@ concatenation.</p>
 <table>
   <tr><th>Argument</th><th>Default</th><th>Description</th></tr>
   <tr><td><code>--headless</code></td><td>off</td><td>Run without the GUI window. The Omniverse runtime still boots but does not create a visible window. Useful for batch processing or SSH.</td></tr>
-  <tr><td><code>--fps &lt;float&gt;</code></td><td>50.0</td><td>Controls the home hold duration (<code>hold_frames = HOME_HOLD_SECONDS &times; fps</code>) and the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
+  <tr><td><code>--fps &lt;float&gt;</code></td><td>50.0</td><td>Controls the video recording frame rate. Does <em>not</em> throttle the simulation &mdash; frames replay as fast as the IK solver and renderer allow.</td></tr>
   <tr><td><code>--use-actions</code></td><td>off</td><td>Read from <code>actions_*</code> h5 keys instead of <code>observations/qpos_*</code>. The actions represent commanded poses; observations represent measured poses. Which one to use depends on your analysis goal.</td></tr>
-  <tr><td><code>--mode {single,dual}</code></td><td>dual</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
-  <tr><td><code>--no-collision</code></td><td>off</td><td>Disable collision between the robots and the table (<code>/World/Cube</code>). Useful when the replay trajectory passes through the table geometry.</td></tr>
-  <tr><td><code>--camera {aria,aria_half}</code></td><td>None</td><td>Set the viewport to a calibrated real-world camera. Uses extrinsics from <code>constants.py</code> to position the camera relative to the robot arm bases. When omitted, the default Isaac Sim viewport is used. See <a href="#camera-setup">Camera Setup</a>.</td></tr>
-  <tr><td><code>--record-sim</code></td><td>off</td><td>Record Isaac Sim viewport to <code>outputs/&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code>. Suffix encodes flags (e.g. <code>qpos</code>, <code>actions_nocol</code>).</td></tr>
+  <tr><td><code>--mode {single,dual}</code></td><td>single</td><td><code>single</code>: loads <code>pandaorca_single.usd</code> with only the right arm. <code>dual</code>: loads <code>pandaorca_dual.usd</code> with both arms.</td></tr>
+  <tr><td><code>--camera {aria,aria_half}</code></td><td>aria</td><td>Set the viewport to a calibrated real-world camera. Uses extrinsics from <code>constants.py</code> to position the camera relative to the robot arm bases. See <a href="#camera-setup">Camera Setup</a>.</td></tr>
+  <tr><td><code>--object {ball,duck,fish,grape,shovel,none}</code></td><td>duck</td><td>Object mesh to spawn and animate via 6D pose trajectory. Only honoured in <code>--mode single</code>. Pass <code>none</code> to skip object spawning entirely. See <a href="#object-replay">Object 6D Pose Replay</a>.</td></tr>
+  <tr><td><code>--object-scale &lt;float&gt;</code></td><td>0.1</td><td>Uniform scale factor for the spawned object (matches <code>OBJECT_DEFAULT_SCALE</code> in <code>constants.py</code>).</td></tr>
+  <tr><td><code>--object-poses &lt;path&gt;</code></td><td>None</td><td>Override the pose trajectory <code>.npz</code> path. By default, the script looks up <code>OBJECT_POSE_PATHS[--object]</code> in <code>constants.py</code>. The <code>.npz</code> must contain a single <code>(N, 4, 4)</code> array of camera-frame transforms.</td></tr>
+  <tr><td><code>--object-pose-camera {aria,aria_half}</code></td><td>aria</td><td>Calibrated camera the object pose <code>.npz</code> is expressed in. The trajectory is transformed into world frame using this camera's extrinsics from <code>CAMERA_CONFIGS</code>.</td></tr>
+  <tr><td><code>--record-sim</code></td><td>off</td><td>Record Isaac Sim viewport to <code>outputs/&lt;H5_STEM&gt;_replay_&lt;SUFFIX&gt;.mp4</code>. Suffix encodes flags (e.g. <code>qpos</code>, <code>actions_duck</code>).</td></tr>
   <tr><td><code>--record-comparison</code></td><td>off</td><td>Record side-by-side comparison (Isaac Sim left, H5 original right) to <code>outputs/&lt;H5_STEM&gt;_comparison_&lt;SUFFIX&gt;.mp4</code>.</td></tr>
   <tr><td><code>--h5-camera {aria,oakd}</code></td><td>aria</td><td>Which H5 camera to use for <code>--record-comparison</code>. Also determines the default sim resolution.</td></tr>
   <tr><td><code>--no-fast-record</code></td><td>off</td><td>Disable deferred encoding. Slower recording but uses less memory.</td></tr>
@@ -764,39 +863,46 @@ pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia
 </ol>
 
 <h3>Example Commands</h3>
-<pre><code># Dual arm replay (default), with GUI
-python dataset_replay/scripts/test_replay.py
+<pre><code># Default: single arm, duck object, aria camera
+python dataset_replay/scripts/kinematic_replay.py
 
-# Single arm, headless (no window)
-python dataset_replay/scripts/test_replay.py --mode single --headless
+# Headless (no window)
+python dataset_replay/scripts/kinematic_replay.py --headless
 
-# Record Isaac Sim viewport  →  outputs/20250829_180500_replay_qpos.mp4
-python dataset_replay/scripts/test_replay.py --record-sim
+# Record Isaac Sim viewport  →  outputs/20250804_104715_replay_qpos_duck.mp4
+python dataset_replay/scripts/kinematic_replay.py --record-sim
 
-# Record with Aria camera viewpoint
-python dataset_replay/scripts/test_replay.py --camera aria --record-sim
+# Record with actions data
+python dataset_replay/scripts/kinematic_replay.py --record-sim --use-actions
 
-# Record with actions + no collision  →  outputs/..._replay_actions_nocol.mp4
-python dataset_replay/scripts/test_replay.py --record-sim --use-actions --no-collision
+# Different object mesh + custom trajectory file
+python dataset_replay/scripts/kinematic_replay.py \
+    --object grape --object-poses dataset_replay/data/poses_grape_vda.npz
+
+# Without spawning any object
+python dataset_replay/scripts/kinematic_replay.py --object none
+
+# Dual arm replay (no object trajectory)
+python dataset_replay/scripts/kinematic_replay.py --mode dual
 
 # Side-by-side comparison (Isaac Sim + H5 original)
-python dataset_replay/scripts/test_replay.py --camera aria --record-comparison
+python dataset_replay/scripts/kinematic_replay.py --record-comparison
 
 # Both sim replay and comparison at once
-python dataset_replay/scripts/test_replay.py --camera aria --record-sim --record-comparison
+python dataset_replay/scripts/kinematic_replay.py --record-sim --record-comparison
 
 # Low-memory recording (inline encoding)
-python dataset_replay/scripts/test_replay.py --record-sim --no-fast-record
+python dataset_replay/scripts/kinematic_replay.py --record-sim --no-fast-record
 
 # Custom sim resolution
-python dataset_replay/scripts/test_replay.py --record-comparison --sim-resolution 960x720
+python dataset_replay/scripts/kinematic_replay.py --record-comparison --sim-resolution 960x720
 
 # Extract H5 camera video (standalone, no GPU needed)
 python dataset_replay/scripts/record_h5.py
 python dataset_replay/scripts/record_h5.py --h5-camera oakd
 
 # Custom frame rate
-python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
+python dataset_replay/scripts/kinematic_replay.py --fps 30</code></pre>
 
 <h3>Regenerating the Lula Descriptor</h3>
 <pre><code>python dataset_replay/scripts/utils/generate_lula_description.py \
@@ -840,28 +946,33 @@ python dataset_replay/scripts/test_replay.py --fps 30</code></pre>
 <h2 id="files">File Structure</h2>
 <pre><code>dataset_replay/
   scripts/
-    test_setup.py                 # Minimal robot init + sim loop
-    test_replay.py                # Main replay script (documented here)
-    test_object_spawn.py          # Spawn objects on the table with physics
+    test_setup.py                 # Scene setup: IK home pose + optional object spawn + camera preview
+    kinematic_replay.py           # Kinematic replay (documented here) — object follows trajectory exactly
+    dynamic_replay.py             # Dynamic replay — object follows physics with D6 spring-damper tracking
     record_h5.py                  # Extract H5 camera images to MP4 (no GPU)
+    calculate_table_depth.py      # Compute camera→table-corner depths (no GPU)
     utils/
       __init__.py                 # Convenience re-exports (safe before SimulationApp)
-      constants.py                # All shared constants (paths, joint names, home poses)
+      constants.py                # All shared constants (paths, joint names, home poses, object/pose registries)
       app.py                      # SimulationApp creation + shared argparse flags
-      robot.py                    # Articulation setup, DOF resolution, collision control
+      robot.py                    # Articulation setup, DOF resolution
       rotation.py                 # Quaternion math (pure numpy/scipy)
       ik.py                       # IK solver creation, solving, position-setter factory
       h5_loader.py                # HDF5 trajectory + image loading
+      poses.py                    # 6D pose trajectory loader, frame transforms, pose averaging
       camera.py                   # Camera setup from calibration extrinsics/intrinsics
-      capture.py                  # Video capture: sim viewport, H5 export, side-by-side
-      object.py                   # Object spawning + physics (collision, gravity)
+      capture.py                  # Viewport video capture + side-by-side comparison
+      viewport.py                 # Shared omni.kit.viewport.utility import helper
+      object.py                   # Object spawning, pose updates, D6 tracking joints, collision filtering
       generate_lula_description.py  # Utility to regenerate the Lula YAML
   data/
     20250804_104715.h5            # Single arm dataset (1199 frames)
     20250829_180500.h5            # Dual arm dataset (1928 frames)
+    poses_duck_vda.npz            # 6D pose trajectory for the duck (1199 × 4×4, camera frame)
   objects/                        # 3D object meshes (ball, duck, fish, grape, shovel)
   docs/
-    test_replay.html              # This file
+    kinematic_replay.html         # This file
+    dynamic_replay_strategy.html  # Design rationale for dynamic replay (D6 joint approach)
   outputs/                        # Generated videos (created automatically)
   notebooks/
     inspect_h5.ipynb              # Jupyter notebook for inspecting h5 contents

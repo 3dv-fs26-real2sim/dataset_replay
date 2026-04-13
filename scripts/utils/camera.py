@@ -7,14 +7,12 @@ Depends on Isaac Sim / pxr (deferred import).
 Must be imported after SimulationApp is created.
 """
 
-import importlib
-
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from pxr import Gf, Usd, UsdGeom
 
 from .constants import CAMERA_CONFIGS
+from .poses import average_poses
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
 # Rotate 180° around X to convert between the two.
@@ -75,7 +73,7 @@ def compute_camera_world_pose(stage, extrinsics, left_prim_path, right_prim_path
     if len(poses) == 1:
         result = poses[0]
     else:
-        result = _average_poses(poses)
+        result = average_poses(poses)
 
     pos = result[:3, 3]
     print(f"[camera] Camera world position: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
@@ -121,6 +119,7 @@ def create_camera_prim(stage, prim_path, world_pose, intrinsics):
     # USD uses focalLength (mm) and aperture (mm).  We pick an arbitrary
     # focal-length value and derive the aperture so that the projection
     # matches the pinhole model.
+    #! Are we sure this is done correctly? Double-check. 
     focal_length_mm = 24.0  # arbitrary — only the ratio matters
     h_aperture = focal_length_mm * intrinsics["width"]  / intrinsics["fx"]
     v_aperture = focal_length_mm * intrinsics["height"] / intrinsics["fy"]
@@ -143,7 +142,8 @@ def create_camera_prim(stage, prim_path, world_pose, intrinsics):
 
 def set_viewport_camera(camera_path):
     """Set the active viewport to render from the given camera prim."""
-    viewport_utility = _import_viewport_utility()
+    from .viewport import get_viewport_utility
+    viewport_utility = get_viewport_utility()
     if viewport_utility is None:
         print("[camera] Warning: could not set viewport camera (omni.kit.viewport.utility unavailable)")
         return
@@ -157,34 +157,4 @@ def set_viewport_camera(camera_path):
 # ── Private helpers ──────────────────────────────────────────────────────────
 
 
-def _average_poses(poses):
-    """Average multiple 4x4 poses (position mean + rotation mean)."""
-    positions = np.array([p[:3, 3] for p in poses])
-    avg_pos = positions.mean(axis=0)
 
-    rotations = Rotation.from_matrix([p[:3, :3] for p in poses])
-    avg_rot = rotations.mean().as_matrix()
-
-    result = np.eye(4)
-    result[:3, :3] = avg_rot
-    result[:3, 3] = avg_pos
-    return result
-
-
-def _import_viewport_utility():
-    """Import omni.kit.viewport.utility, enabling the extension if needed."""
-    try:
-        return importlib.import_module("omni.kit.viewport.utility")
-    except ModuleNotFoundError:
-        pass
-    try:
-        app = importlib.import_module("omni.kit.app")
-        app.get_app().get_extension_manager().set_extension_enabled_immediate(
-            "omni.kit.viewport.utility", True,
-        )
-    except Exception:
-        return None
-    try:
-        return importlib.import_module("omni.kit.viewport.utility")
-    except ModuleNotFoundError:
-        return None
