@@ -21,6 +21,7 @@ def load_object_world_trajectory(
     n_frames: int,
     mode: str,
     right_prim_path: str,
+    object_pose_version: str | None = None,
 ):
     """Load an object's 6D pose trajectory and transform it to world frame.
 
@@ -36,6 +37,9 @@ def load_object_world_trajectory(
         n_frames: Expected frame count from the H5 dataset.
         mode: Replay mode (``"single"`` or ``"dual"``).
         right_prim_path: Prim path of the right robot arm.
+        object_pose_version: Pose-trajectory version key (e.g. ``"vda"``,
+            ``"depthpro"``).  Ignored when ``object_poses_override`` is set.
+            When ``None``, falls back to ``OBJECT_POSE_DEFAULT_VERSION``.
 
     Returns:
         ``(N, 4, 4)`` array of world-frame transforms, or ``None`` if the
@@ -52,10 +56,13 @@ def load_object_world_trajectory(
         print(f"[object] Skipping object spawn — only available in --mode single (got {mode})")
         return None
 
-    npz_path = resolve_object_pose_path(object_name, object_poses_override)
+    npz_path = resolve_object_pose_path(
+        object_name, object_poses_override, object_pose_version,
+    )
     if npz_path is None:
         print(
-            f"[object] No default pose trajectory for '{object_name}'. "
+            f"[object] No default pose trajectory for '{object_name}' "
+            f"(version={object_pose_version!r}). "
             f"Pass --object-poses to provide one. Skipping spawn."
         )
         return None
@@ -81,7 +88,11 @@ def load_object_world_trajectory(
     return traj_world
 
 
-def resolve_object_pose_path(object_name: str, object_poses_override: str | None = None):
+def resolve_object_pose_path(
+    object_name: str,
+    object_poses_override: str | None = None,
+    object_pose_version: str | None = None,
+):
     """Find the .npz pose trajectory for the chosen object, or None to skip spawn.
 
     Args:
@@ -89,15 +100,29 @@ def resolve_object_pose_path(object_name: str, object_poses_override: str | None
             any string when ``object_poses_override`` is given).
         object_poses_override: Explicit path to a .npz file.  When provided,
             this takes precedence over the default lookup.
+        object_pose_version: Which pose-estimator variant to pick from
+            ``OBJECT_POSE_PATHS[object_name]`` (e.g. ``"vda"``, ``"depthpro"``).
+            When ``None``, falls back to ``OBJECT_POSE_DEFAULT_VERSION``.
 
     Returns:
         ``Path`` to the .npz file, or ``None`` if no trajectory is available.
     """
-    from .constants import OBJECT_POSE_PATHS
+    from .constants import OBJECT_POSE_PATHS, OBJECT_POSE_DEFAULT_VERSION
 
     if object_poses_override is not None:
         return Path(object_poses_override)
-    return OBJECT_POSE_PATHS.get(object_name)
+
+    versions = OBJECT_POSE_PATHS.get(object_name)
+    if versions is None:
+        return None
+
+    version = object_pose_version or OBJECT_POSE_DEFAULT_VERSION
+    if version not in versions:
+        raise ValueError(
+            f"Unknown pose version '{version}' for object '{object_name}'. "
+            f"Available: {sorted(versions.keys())}"
+        )
+    return versions[version]
 
 
 def spawn_object(
@@ -108,6 +133,7 @@ def spawn_object(
     objects_dir: Path,
     *,
     kinematic: bool = False,
+    collision: bool = True,
 ) -> str:
     """Spawn an OBJ mesh into the scene with physics enabled.
 
@@ -120,6 +146,8 @@ def spawn_object(
         kinematic: When ``True``, the rigid body is *kinematic*: gravity is disabled
             and the body will not respond to forces. Use with ``set_object_world_pose``
             to drive it from an external trajectory (e.g. a 6D pose estimator).
+        collision: When ``False``, no collision geometry is added — the object is
+            purely visual and cannot interact with any physics body.
 
     Returns:
         The prim path of the spawned object.
@@ -167,7 +195,7 @@ def spawn_object(
     xform_api = UsdGeom.XformCommonAPI(prim)
     xform_api.SetTranslate(Gf.Vec3d(position[0], position[1], position[2]))
     xform_api.SetScale(Gf.Vec3f(scale, scale, scale))
-    _setup_rigid_body(prim, kinematic=kinematic)
+    _setup_rigid_body(prim, kinematic=kinematic, collision=collision)
     return prim_path
 
 
@@ -287,13 +315,16 @@ def filter_collision_pair(stage, prim_path_a: str, prim_path_b: str) -> None:
 # ── Internal helpers ────────────────────────────────────────────────────────
 
 
-def _setup_rigid_body(root_prim: Usd.Prim, *, kinematic: bool) -> None:
+def _setup_rigid_body(root_prim: Usd.Prim, *, kinematic: bool, collision: bool = True) -> None:
     """Apply rigid-body + collision APIs.
 
     For kinematic bodies, gravity is disabled and the kinematic flag is set,
     so PhysX follows externally-prescribed transforms instead of integrating
     forces. The object can still collide with other dynamic bodies (e.g. the
     table) — kinematic bodies push dynamics but ignore forces themselves.
+
+    When ``collision=False``, no ``CollisionAPI`` is applied to any mesh prim,
+    making the object purely visual with no physics interaction.
     """
     rb_api = UsdPhysics.RigidBodyAPI.Apply(root_prim)
     rb_api.CreateRigidBodyEnabledAttr(True)
@@ -306,8 +337,9 @@ def _setup_rigid_body(root_prim: Usd.Prim, *, kinematic: bool) -> None:
     except Exception:
         pass
 
-    for prim in Usd.PrimRange(root_prim):
-        if prim.IsA(UsdGeom.Mesh):
-            UsdPhysics.CollisionAPI.Apply(prim)
-            mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
-            mesh_collision_api.CreateApproximationAttr("convexHull")
+    if collision:
+        for prim in Usd.PrimRange(root_prim):
+            if prim.IsA(UsdGeom.Mesh):
+                UsdPhysics.CollisionAPI.Apply(prim)
+                mesh_collision_api = UsdPhysics.MeshCollisionAPI.Apply(prim)
+                mesh_collision_api.CreateApproximationAttr("convexHull")

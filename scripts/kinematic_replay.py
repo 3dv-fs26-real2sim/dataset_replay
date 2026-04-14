@@ -5,7 +5,7 @@ from utils.app import add_common_args, create_app, resolve_usd_path, resolve_h5_
 from utils.constants import (
     CAMERA_CONFIGS, H5_IMAGE_PATHS, H5_DEFAULT_CAMERA,
     OBJECT_CHOICES, OBJECT_DEFAULT_SCALE,
-    OBJECT_POSE_DEFAULT_CAMERA,
+    OBJECT_POSE_DEFAULT_CAMERA, OBJECT_POSE_PATHS, OBJECT_POSE_DEFAULT_VERSION,
 )
 from utils.h5_loader import get_h5_image_dims
 
@@ -35,6 +35,13 @@ parser.add_argument(
     "--object-poses", type=str, default=None,
     help="Override path to object pose .npz (default: lookup OBJECT_POSE_PATHS for --object). "
          "Must contain a single (N, 4, 4) array of camera-frame transforms.",
+)
+parser.add_argument(
+    "--object-pose-version", type=str, default=OBJECT_POSE_DEFAULT_VERSION,
+    help=f"Pose-estimator version to load from OBJECT_POSE_PATHS[--object] "
+         f"(default: {OBJECT_POSE_DEFAULT_VERSION}). Ignored when --object-poses is set. "
+         f"Available per object: "
+         + ", ".join(f"{k}=[{'/'.join(sorted(v.keys()))}]" for k, v in OBJECT_POSE_PATHS.items()),
 )
 parser.add_argument(
     "--object-pose-camera", type=str, default=OBJECT_POSE_DEFAULT_CAMERA,
@@ -106,14 +113,22 @@ def _build_video_suffix(args) -> str:
     """Build a descriptive suffix from the active flags.
 
     Examples:
-        qpos                (defaults)
-        actions             --use-actions
-        qpos_duck           --object duck (default for single mode)
+        qpos                       (defaults)
+        actions                    --use-actions
+        qpos_duck_vda              --object duck (default version)
+        qpos_duck_depthpro         --object-pose-version depthpro
+        qpos_duck_<stem>           --object-poses /path/to/<stem>.npz
     """
+    from pathlib import Path as _Path
+
     parts = []
     parts.append("actions" if args.use_actions else "qpos")
     if args.object != "none" and args.mode == "single":
         parts.append(args.object)
+        if args.object_poses is not None:
+            parts.append(_Path(args.object_poses).stem)
+        else:
+            parts.append(args.object_pose_version)
     return "_".join(parts)
 
 
@@ -128,6 +143,7 @@ def _setup_object_replay(args, stage, n_frames):
         stage, args.object, args.object_poses,
         args.object_pose_camera, n_frames,
         args.mode, FRANKA_RIGHT_PATH,
+        object_pose_version=args.object_pose_version,
     )
     if traj_world is None:
         return None, None
@@ -140,9 +156,10 @@ def _setup_object_replay(args, stage, n_frames):
         scale=args.object_scale,
         objects_dir=OBJECTS_DIR,
         kinematic=True,
+        collision=False,
     )
     set_object_world_pose(stage, prim_path, initial_pose)
-    print(f"[object] Spawned '{args.object}' (kinematic) at {prim_path}")
+    print(f"[object] Spawned '{args.object}' (kinematic, no collision) at {prim_path}")
 
     return prim_path, traj_world
 
@@ -171,6 +188,7 @@ def main():
     arms = add_articulations(world, args.mode)
     world.reset()
     setup_arms_ik(arms)
+
 
     stage = omni.usd.get_context().get_stage()
 
