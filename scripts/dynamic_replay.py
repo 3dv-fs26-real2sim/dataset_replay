@@ -79,13 +79,13 @@ parser.add_argument(
     help="Record Isaac Sim viewport to MP4",
 )
 parser.add_argument(
-    "--record-comparison", action="store_true",
+    "--record-sidebyside", action="store_true",
     help="Record side-by-side comparison (Isaac Sim left, H5 original right)",
 )
 parser.add_argument(
     "--h5-camera", type=str, default=H5_DEFAULT_CAMERA,
     choices=list(H5_IMAGE_PATHS.keys()),
-    help=f"Which H5 camera to use for --record-comparison (default: {H5_DEFAULT_CAMERA})",
+    help=f"Which H5 camera to use for --record-sidebyside (default: {H5_DEFAULT_CAMERA})",
 )
 parser.add_argument(
     "--no-fast-record", action="store_true",
@@ -248,7 +248,7 @@ def main():
 
     # ── Video capture setup ─────────────────────────────────────────────────
     suffix = _build_video_suffix(args)
-    recorder, sim_output_path, sbs_recorder, sbs_output_path = (
+    recorder, sim_output_path, sbs_recorder, sbs_output_path, _overlay_recorders = (
         setup_recording(args, h5_path, n_frames, suffix, APP_WIDTH, APP_HEIGHT)
     )
     captured_frames = 0
@@ -297,7 +297,7 @@ def main():
 
     close_sidebyside(sbs_recorder)
     if sbs_recorder is not None:
-        print(f"[capture] Saved comparison to {sbs_output_path} "
+        print(f"[capture] Saved side-by-side to {sbs_output_path} "
               f"({sbs_recorder['frames_written']} frames)")
 
     print("[replay] Done.")

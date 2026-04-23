@@ -48,7 +48,10 @@ python scripts/kinematic_replay.py
 python scripts/kinematic_replay.py --record-sim
 
 # Side-by-side comparison (Isaac Sim + H5 original)
-python scripts/kinematic_replay.py --record-comparison
+python scripts/kinematic_replay.py --record-sidebyside
+
+# Alpha-blended overlay of sim and H5 (one MP4 per sim-opacity value)
+python scripts/kinematic_replay.py --record-overlay 0.3,0.5,0.7
 
 # Dual arm replay (no object)
 python scripts/kinematic_replay.py --mode dual
@@ -108,7 +111,7 @@ scripts/
 | Script | Description |
 | --- | --- |
 | `test_setup.py` | Loads a USD scene, computes IK home arm joints, optionally spawns an object, sets the home pose, and holds it. Defaults to `--mode single --object duck`. Supports `--camera` to preview calibrated viewpoints and `--object`/`--position`/`--scale` for object spawning. Runs until the window is closed. Use this to verify the scene and home pose look correct before running replay. |
-| `kinematic_replay.py` | Kinematic replay. Defaults to `--mode single --camera aria --object duck`. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. The object is spawned as a kinematic rigid body that follows the 6D pose trajectory exactly (no physics). Supports `--record-sim` for video, `--record-comparison` for side-by-side. See `docs/kinematic_replay.html` for detailed documentation. |
+| `kinematic_replay.py` | Kinematic replay. Defaults to `--mode single --camera aria --object duck`. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. The object is spawned as a kinematic rigid body that follows the 6D pose trajectory exactly (no physics). Supports `--record-sim` for video, `--record-sidebyside` for side-by-side, and `--record-overlay` for alpha-blended overlays of the sim and H5 video (comma-separated list of sim-opacity values). See `docs/kinematic_replay.html` for detailed documentation. |
 | `dynamic_replay.py` | Dynamic replay. Same defaults as kinematic replay (`--mode single --camera aria --object duck`). The object is a dynamic rigid body that follows physics (gravity, collisions). A kinematic anchor follows the trajectory, and a D6 joint with spring-damper drives pulls the object toward it. Tune with `--stiffness` (default 500), `--damping` (default 100), and `--object-mass` (default 0.1 kg). See `docs/dynamic_replay_strategy.html` for design rationale. |
 | `record_h5.py` | Standalone script to extract original camera images from H5 files to MP4. No Isaac Sim or GPU required. Supports `--h5-camera` (`aria`, `oakd`), `--mode`, `--fps`, `--h5-path`. |
 | `calculate_table_depth.py` | Computes camera-to-table-corner depths analytically using calibration data. No Isaac Sim required. |

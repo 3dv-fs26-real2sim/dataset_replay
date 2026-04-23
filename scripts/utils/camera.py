@@ -22,7 +22,8 @@ _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 # ── Public API ───────────────────────────────────────────────────────────────
 
 
-def setup_camera(stage, camera_name, mode, left_prim_path, right_prim_path):
+def setup_camera(stage, camera_name, mode, left_prim_path, right_prim_path,
+                 world_pose_override=None):
     """Create a calibrated camera and set it as the active viewport camera.
 
     Args:
@@ -31,16 +32,32 @@ def setup_camera(stage, camera_name, mode, left_prim_path, right_prim_path):
         mode: "single" or "dual".
         left_prim_path: Prim path of the left robot arm (ignored in single mode).
         right_prim_path: Prim path of the right robot arm.
+        world_pose_override: Optional 4x4 column-vector camera-in-world pose.
+            When provided, the nominal base-to-camera extrinsics are bypassed
+            and this pose is used directly — used by ``kinematic_replay.py
+            --refined-extrinsic`` to consume output from
+            ``scripts/refine_camera_extrinsic.py``.
 
     Returns:
         The USD prim path of the created camera (e.g. "/World/AriaCamera").
     """
     config = CAMERA_CONFIGS[camera_name]
-    extrinsics = config["extrinsics"]
     intrinsics = config["intrinsics"]
 
-    left_path = left_prim_path if mode == "dual" else None
-    world_pose = compute_camera_world_pose(stage, extrinsics, left_path, right_prim_path)
+    if world_pose_override is not None:
+        world_pose = np.asarray(world_pose_override, dtype=float)
+        if world_pose.shape != (4, 4):
+            raise ValueError(
+                f"world_pose_override must be 4x4, got {world_pose.shape}"
+            )
+        pos = world_pose[:3, 3]
+        print(f"[camera] Using refined world pose: "
+              f"[{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+    else:
+        left_path = left_prim_path if mode == "dual" else None
+        world_pose = compute_camera_world_pose(
+            stage, config["extrinsics"], left_path, right_prim_path,
+        )
 
     prim_path = f"/World/{camera_name.capitalize()}Camera"
     create_camera_prim(stage, prim_path, world_pose, intrinsics)

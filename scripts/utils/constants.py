@@ -60,6 +60,23 @@ FRANKA_LEFT_PATH  = "/World/fer_orcahand_left_extended"
 FRANKA_RIGHT_PATH = "/World/fer_orcahand_right_extended"
 TABLE_PRIM_PATH   = "/World/Cube"
 
+# ── Table geometry in world frame ────────────────────────────────────────────
+# Matches /World/Cube in pandaorca_{single,dual}.usd: a 1.0 × 1.4 × 1.0 m box
+# centred at (0, 0, 0.5).  Refinement lines live on the top plane.
+TABLE_TOP_Z  = 1.0
+TABLE_X_HALF = 0.5
+TABLE_Y_HALF = 0.7
+
+# 3D line segments on the table top, used by the camera extrinsic refiner
+# (scripts/refine_camera_extrinsic.py).  Each is a (2, 3) array of endpoints.
+TABLE_TOP_EDGE_WORLD  = np.array([[+TABLE_X_HALF, -TABLE_Y_HALF, TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z]])
+TABLE_LEFT_EDGE_WORLD = np.array([[-TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z]])
+# The physical seam splits the table along world X (at y = 0), not along Y.
+TABLE_SEAM_WORLD      = np.array([[-TABLE_X_HALF, 0.0,           TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, 0.0,           TABLE_TOP_Z]])
+
 # ── DOF counts ────────────────────────────────────────────────────────────────
 N_ARM_DOFS      = 7
 N_ARM_POSE_DIMS = 7   # 3 position (xyz) + 4 quaternion (wxyz)
