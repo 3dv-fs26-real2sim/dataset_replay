@@ -227,6 +227,8 @@ def main():
             refined_camera_name = str(_ref["camera"]) if "camera" in _ref.files else None
         print(f"[refine] Loaded refined extrinsic from {ref_path} "
               f"(camera={refined_camera_name})")
+        with np.printoptions(precision=6, suppress=True):
+            print(f"[refine] T_world_cam =\n{refined_T_world_cam}")
 
     # Apply the override to the object trajectory only when the refinement
     # camera matches --object-pose-camera (otherwise fall back to nominal).
