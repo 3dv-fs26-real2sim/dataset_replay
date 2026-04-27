@@ -42,6 +42,7 @@ OBJECT_POSE_PATHS = {
         "vda":              PROJECT_ROOT / "data" / "poses_duck_vda.npz",
         "depthpro":         PROJECT_ROOT / "data" / "poses_duck_depthpro.npz",
         "dav3_tablescale":  PROJECT_ROOT / "data" / "poses_duck_dav3_tablescale.npz",
+        "vda_palm_rot":     PROJECT_ROOT / "data" / "poses_duck_vda_palm_rot.npz",
     },
 }
 
