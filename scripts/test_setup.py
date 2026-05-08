@@ -1,146 +1,86 @@
-"""Test robot setup — load scene, optionally spawn an object, hold IK home pose.
+"""Visual smoke test for the procedural scene + robot setup.
+
+Loads ``SceneConfig`` defaults, builds the scene, sets the robot to the
+home pose via IK, and holds it. Useful for eyeballing table dimensions,
+wall heights, AprilTag placement, and robot mount pose against your
+physical setup.
 
 Usage:
     python dataset_replay/scripts/test_setup.py
-    python dataset_replay/scripts/test_setup.py --mode dual --camera aria
-    python dataset_replay/scripts/test_setup.py --object none
+    python dataset_replay/scripts/test_setup.py --headless --duration 5
 """
 
 import argparse
+import sys
+import time
+from pathlib import Path
+
+# Allow running from project root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.app import add_common_args, create_app
-from utils.constants import CAMERA_CONFIGS, OBJECT_CHOICES, OBJECT_DEFAULT_SCALE
+from utils.config import SceneConfig
 
-parser = argparse.ArgumentParser(
-    description="Test robot setup — load scene, optionally spawn object, hold IK home pose",
-)
+# ── CLI ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
 add_common_args(parser)
-parser.set_defaults(mode="single")
-parser.add_argument(
-    "--camera", type=str, default=None, choices=list(CAMERA_CONFIGS.keys()),
-    help="Set viewport to a calibrated camera (default: use Isaac Sim default viewport)",
-)
-parser.add_argument(
-    "--object", type=str, default="duck", choices=OBJECT_CHOICES + ["none"],
-    help="Object to spawn (default: duck). Use 'none' to skip object spawning.",
-)
-parser.add_argument(
-    "--position", type=float, nargs=3, default=[0.0, 0.0, 1.0],
-    metavar=("X", "Y", "Z"),
-    help="Object spawn position in meters (default: 0.0 0.0 1.0)",
-)
-parser.add_argument(
-    "--scale", type=float, default=OBJECT_DEFAULT_SCALE,
-    help=f"Object uniform scale factor (default: {OBJECT_DEFAULT_SCALE})",
-)
+parser.add_argument("--duration", type=float, default=0.0,
+                    help="Hold the home pose for N seconds before exiting "
+                         "(0 = run until window closed; default 0)")
+parser.add_argument("--no-camera", action="store_true",
+                    help="Skip OAK-D camera setup (skip if intrinsics aren't filled in)")
+parser.add_argument("--no-object", action="store_true",
+                    help="Skip spawning the duck object")
 args = parser.parse_args()
 
+# ── Boot Isaac Sim FIRST ─────────────────────────────────────────────────────
 simulation_app = create_app(args)
 
-# Isaac Sim imports must come after SimulationApp creation.
-from isaacsim.core.api import World
+# Now safe to import everything Isaac/pxr.
+from isaacsim.core.api import World  # noqa: E402
 
-from utils.constants import (
-    FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
-    FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH,
-    ARM_JOINT_NAMES, HAND_LEFT_JOINT_NAMES, HAND_RIGHT_JOINT_NAMES,
-    HAND_HOME_JOINT_VALUES,
-    EE_FRAME_NAME,
-    LULA_DESCRIPTOR_PATH, URDF_PATH,
-    WRIST_HOME_POSITION, WRIST_HOME_ROTATION,
-    EE_WRIST_OFFSET_IN_LINK8,
-)
-from utils.rotation import rotation_matrix_to_wxyz
-from utils.robot import setup_articulation, resolve_dof_indices, print_dof_info
-from utils.ik import create_ik_solver, solve_ik_for_pose
-from utils.camera import setup_camera
-from utils.object import spawn_object
-from utils.constants import OBJECTS_DIR
-from utils.scene import build_scene
+from utils.config import PROJECT_ROOT  # noqa: E402
+from utils.object import spawn_object  # noqa: E402
+from utils.robot import setup_robot  # noqa: E402
+from utils.scene import build_scene  # noqa: E402
 
+# ── Build scene + robot ──────────────────────────────────────────────────────
+cfg = SceneConfig()
+print(f"[test_setup] mount xyz   = {cfg.robot.mount_xyz}")
+print(f"[test_setup] table dims  = {cfg.table.combined_size_xy} m, top z={cfg.table.top_z}")
+print(f"[test_setup] AprilTag XY = {cfg.apriltag_world_pose()[:3, 3]}")
 
-def main():
-    stage = build_scene(args.mode)
+stage = build_scene(cfg, robot_collision=False)
 
-    world = World()
-    franka_right = setup_articulation(FRANKA_RIGHT_PATH, world)
-    if args.mode == "dual":
-        franka_left = setup_articulation(FRANKA_LEFT_PATH, world)
-    world.reset()
+world = World()
+robot = setup_robot(world, cfg)
+print(f"[test_setup] arm DOFs:  {robot['arm_dof_indices']}")
+print(f"[test_setup] hand DOFs: {robot['hand_dof_indices']}")
 
-    if args.camera is not None:
-        camera_prim_path = setup_camera(
-            stage, args.camera, args.mode,
-            FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH,
-        )
-        print(f"[camera] Viewport set to {camera_prim_path}")
+# ── Optional camera ──────────────────────────────────────────────────────────
+if not args.no_camera:
+    try:
+        from utils.camera import setup_camera
+        setup_camera(stage, cfg.camera)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"[test_setup] Skipping camera setup: {e}")
 
-    # Create IK solvers (same URDF + EE frame for both arms).
-    ik_solver_right = create_ik_solver(URDF_PATH, LULA_DESCRIPTOR_PATH, "right")
-    if args.mode == "dual":
-        ik_solver_left = create_ik_solver(URDF_PATH, LULA_DESCRIPTOR_PATH, "left")
+# ── Optional duck spawn (visual sanity check) ────────────────────────────────
+if not args.no_object:
+    objects_dir = PROJECT_ROOT / "objects"
+    if (objects_dir / "duck" / "duck.obj").exists():
+        prim = spawn_object(stage, "duck", objects_dir,
+                            position=(-0.10, -0.20, cfg.table.top_z + 0.05),
+                            scale=0.10, kinematic=True, collision=False)
+        print(f"[test_setup] Spawned duck at {prim}")
 
-    # Compute home arm joint values via IK.
-    home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
-    home_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
-    home_arm_joints, _ = solve_ik_for_pose(
-        ik_solver_right, EE_FRAME_NAME,
-        home_link8_pos, home_wrist_quat,
-    )
-    if home_arm_joints is None:
-        raise RuntimeError(
-            f"IK failed for home wrist pose "
-            f"(link8_pos={home_link8_pos}, quat={home_wrist_quat}). "
-            f"Check EE_FRAME_NAME='{EE_FRAME_NAME}' and the Lula descriptor."
-        )
-    print(f"[IK] Home arm joints RIGHT (rad): {home_arm_joints}")
+# ── Hold pose ────────────────────────────────────────────────────────────────
+print("[test_setup] Holding home pose. Ctrl-C to exit (or pass --duration).")
+t0 = time.time()
+while simulation_app.is_running():
+    world.step(render=True)
+    if args.duration > 0 and (time.time() - t0) >= args.duration:
+        break
 
-    if args.mode == "dual":
-        home_arm_joints_left, _ = solve_ik_for_pose(
-            ik_solver_left, EE_FRAME_NAME,
-            home_link8_pos, home_wrist_quat,
-        )
-        if home_arm_joints_left is None:
-            raise RuntimeError(
-                f"IK failed for left arm home wrist pose "
-                f"(link8_pos={home_link8_pos}, quat={home_wrist_quat}). "
-                f"Check EE_FRAME_NAME='{EE_FRAME_NAME}' and the Lula descriptor."
-            )
-        print(f"[IK] Home arm joints LEFT  (rad): {home_arm_joints_left}")
-
-    # Resolve DOF indices.
-    print_dof_info("franka_right", franka_right)
-    arm_idx_right = resolve_dof_indices(franka_right, ARM_JOINT_NAMES, "franka_right")
-    hand_idx_right = resolve_dof_indices(franka_right, HAND_RIGHT_JOINT_NAMES, "franka_right")
-    if args.mode == "dual":
-        print_dof_info("franka_left", franka_left)
-        arm_idx_left = resolve_dof_indices(franka_left, ARM_JOINT_NAMES, "franka_left")
-        hand_idx_left = resolve_dof_indices(franka_left, HAND_LEFT_JOINT_NAMES, "franka_left")
-
-    # Set home pose.
-    q_home_right = franka_right.get_joint_positions().copy()
-    q_home_right[arm_idx_right] = home_arm_joints
-    q_home_right[hand_idx_right] = HAND_HOME_JOINT_VALUES
-    franka_right.set_joint_positions(q_home_right)
-    if args.mode == "dual":
-        q_home_left = franka_left.get_joint_positions().copy()
-        q_home_left[arm_idx_left] = home_arm_joints_left
-        q_home_left[hand_idx_left] = HAND_HOME_JOINT_VALUES
-        franka_left.set_joint_positions(q_home_left)
-
-    # Spawn object.
-    if args.object != "none":
-        spawned = spawn_object(stage, args.object, args.position, args.scale, OBJECTS_DIR)
-        print(f"[setup] Spawned '{args.object}' at {args.position} scale {args.scale} -> {spawned}")
-
-    # Hold home pose until window is closed.
-    print("[setup] Holding home pose (close window to exit)")
-    while simulation_app.is_running():
-        world.step(render=True)
-
-    print("[setup] Done.")
-    simulation_app.close()
-
-
-if __name__ == "__main__":
-    main()
+simulation_app.close()

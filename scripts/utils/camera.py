@@ -1,125 +1,53 @@
-"""Camera setup for Isaac Sim viewport from real-world calibration data.
+"""OAK-D Pro AF camera setup — single, world-fixed pinhole camera.
 
-Positions the viewport camera to match a calibrated real-world camera
-(e.g., Aria glasses) using extrinsic transforms relative to robot arm bases.
+The world pose is loaded from a saved extrinsic (output of
+``calibrate_extrinsic.py``), or computed from the nominal position+lookat+up
+in ``CameraConfig`` as a fallback.
 
-Depends on Isaac Sim / pxr (deferred import).
-Must be imported after SimulationApp is created.
+Depends on ``pxr`` and ``omni.usd`` — must be imported after SimulationApp
+is created.
 """
 
-import numpy as np
+from __future__ import annotations
 
+import warnings
+from pathlib import Path
+
+import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
-from .constants import CAMERA_CONFIGS
-from .poses import average_poses
+from .config import CameraConfig
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
-# Rotate 180° around X to convert between the two.
+# Diag(1, -1, -1, 1) flips Y and Z to convert between the two.
 _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
+def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
+                 *, prim_path: str | None = None) -> str:
+    """Create a UsdGeom.Camera at the calibrated (or nominal) world pose and
+    set it as the active viewport camera. Returns the camera prim path."""
+    _check_intrinsics(cfg.intrinsics)
 
+    world_pose = _resolve_world_pose(cfg)
+    pos = world_pose[:3, 3]
+    print(f"[camera] {cfg.name}: world position [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 
-def setup_camera(stage, camera_name, mode, left_prim_path, right_prim_path,
-                 world_pose_override=None):
-    """Create a calibrated camera and set it as the active viewport camera.
-
-    Args:
-        stage: USD stage.
-        camera_name: Key into CAMERA_CONFIGS (e.g. "aria").
-        mode: "single" or "dual".
-        left_prim_path: Prim path of the left robot arm (ignored in single mode).
-        right_prim_path: Prim path of the right robot arm.
-        world_pose_override: Optional 4x4 column-vector camera-in-world pose.
-            When provided, the nominal base-to-camera extrinsics are bypassed
-            and this pose is used directly — consumed by
-            ``kinematic_replay.py --refined-extrinsic``.
-
-    Returns:
-        The USD prim path of the created camera (e.g. "/World/AriaCamera").
-    """
-    config = CAMERA_CONFIGS[camera_name]
-    intrinsics = config["intrinsics"]
-
-    if world_pose_override is not None:
-        world_pose = np.asarray(world_pose_override, dtype=float)
-        if world_pose.shape != (4, 4):
-            raise ValueError(
-                f"world_pose_override must be 4x4, got {world_pose.shape}"
-            )
-        pos = world_pose[:3, 3]
-        print(f"[camera] Using refined world pose: "
-              f"[{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
-    else:
-        left_path = left_prim_path if mode == "dual" else None
-        world_pose = compute_camera_world_pose(
-            stage, config["extrinsics"], left_path, right_prim_path,
-        )
-
-    prim_path = f"/World/{camera_name.capitalize()}Camera"
-    create_camera_prim(stage, prim_path, world_pose, intrinsics)
+    prim_path = prim_path or f"/World/Cameras/{_camel(cfg.name)}"
+    UsdGeom.Xform.Define(stage, "/World/Cameras")
+    create_camera_prim(stage, prim_path, world_pose, cfg)
     set_viewport_camera(prim_path)
     return prim_path
 
 
-def compute_camera_world_pose(stage, extrinsics, left_prim_path, right_prim_path):
-    """Compute the camera world pose by transforming through robot base poses.
-
-    In dual mode both arm bases are used and the results averaged.
-    In single mode (left_prim_path is None) only the right arm is used.
-
-    Returns:
-        4x4 homogeneous matrix — camera pose in world frame.
-    """
-    poses = []
-
-    # Right arm (always available).
-    T_world_base_r = get_prim_world_transform(stage, right_prim_path)
-    T_world_cam_r = T_world_base_r @ extrinsics["right"]
-    poses.append(T_world_cam_r)
-
-    # Left arm (dual mode only).
-    if left_prim_path is not None:
-        T_world_base_l = get_prim_world_transform(stage, left_prim_path)
-        T_world_cam_l = T_world_base_l @ extrinsics["left"]
-        poses.append(T_world_cam_l)
-
-    if len(poses) == 1:
-        result = poses[0]
-    else:
-        result = average_poses(poses)
-
-    pos = result[:3, 3]
-    print(f"[camera] Camera world position: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
-    return result
-
-
-def get_prim_world_transform(stage, prim_path):
-    """Get the 4x4 column-vector-convention world transform of a USD prim.
-
-    USD's Gf.Matrix4d uses row-vector convention (p' = p * M).
-    We transpose to standard column-vector convention (p' = M * p).
-    """
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        raise RuntimeError(f"Prim not found: {prim_path}")
-
-    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    gf_mat = xform_cache.GetLocalToWorldTransform(prim)
-    # Gf.Matrix4d → numpy.  GetArray() returns row-major; transpose for column-vector.
-    return np.array(gf_mat, dtype=float).T
-
-
-def create_camera_prim(stage, prim_path, world_pose, intrinsics):
+def create_camera_prim(stage: Usd.Stage, prim_path: str,
+                       world_pose: np.ndarray, cfg: CameraConfig) -> str:
     """Create a UsdGeom.Camera with the given world pose and pinhole intrinsics.
 
-    Args:
-        stage: USD stage.
-        prim_path: Where to define the camera (e.g. "/World/AriaCamera").
-        world_pose: 4x4 column-vector-convention transform (camera-in-world).
-        intrinsics: dict with keys width, height, fx, fy, cx, cy.
+    The world pose is in OpenCV camera convention (+Z forward); a CV→USD
+    rotation flip is applied so the resulting USD camera looks at the same
+    target as the input pose suggests.
     """
     camera = UsdGeom.Camera.Define(stage, prim_path)
 
@@ -131,37 +59,32 @@ def create_camera_prim(stage, prim_path, world_pose, intrinsics):
     xformable.ClearXformOpOrder()
     xformable.AddTransformOp().Set(gf_mat)
 
-    # Map pinhole intrinsics to USD camera attributes.
-    # USD uses focalLength (mm) and aperture (mm).  We pick an arbitrary
-    # focal-length value and derive the aperture so that the projection
-    # matches the pinhole model.
-    #! Are we sure this is done correctly? Double-check. 
-    focal_length_mm = 24.0  # arbitrary — only the ratio matters
-    h_aperture = focal_length_mm * intrinsics["width"]  / intrinsics["fx"]
-    v_aperture = focal_length_mm * intrinsics["height"] / intrinsics["fy"]
+    # Map pinhole intrinsics → USD camera attributes.
+    K = cfg.intrinsics
+    focal_length_mm = 24.0   # arbitrary — only the ratio aperture/focal matters
+    h_aperture = focal_length_mm * cfg.width  / K["fx"]
+    v_aperture = focal_length_mm * cfg.height / K["fy"]
 
     camera.GetFocalLengthAttr().Set(focal_length_mm)
     camera.GetHorizontalApertureAttr().Set(h_aperture)
     camera.GetVerticalApertureAttr().Set(v_aperture)
 
-    # Principal point offset (0 = centered).
-    cx_offset = (intrinsics["cx"] - intrinsics["width"]  / 2.0) / intrinsics["fx"] * focal_length_mm
-    cy_offset = (intrinsics["cy"] - intrinsics["height"] / 2.0) / intrinsics["fy"] * focal_length_mm
+    # Principal-point offset (0 = centred).
+    cx_offset = (K["cx"] - cfg.width  / 2.0) / K["fx"] * focal_length_mm
+    cy_offset = (K["cy"] - cfg.height / 2.0) / K["fy"] * focal_length_mm
     camera.GetHorizontalApertureOffsetAttr().Set(cx_offset)
     camera.GetVerticalApertureOffsetAttr().Set(cy_offset)
 
-    # Near/far clipping planes (meters).
     camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 100.0))
-
     return prim_path
 
 
-def set_viewport_camera(camera_path):
-    """Set the active viewport to render from the given camera prim."""
+def set_viewport_camera(camera_path: str) -> None:
+    """Switch the active viewport to render from the given camera prim."""
     from .viewport import get_viewport_utility
     viewport_utility = get_viewport_utility()
     if viewport_utility is None:
-        print("[camera] Warning: could not set viewport camera (omni.kit.viewport.utility unavailable)")
+        print("[camera] Warning: omni.kit.viewport.utility unavailable")
         return
     viewport = viewport_utility.get_active_viewport()
     if viewport is None:
@@ -170,7 +93,79 @@ def set_viewport_camera(camera_path):
     viewport.set_active_camera(camera_path)
 
 
-# ── Private helpers ──────────────────────────────────────────────────────────
+def get_prim_world_transform(stage: Usd.Stage, prim_path: str) -> np.ndarray:
+    """Return the 4x4 column-vector-convention world transform of a USD prim."""
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        raise RuntimeError(f"Prim not found: {prim_path}")
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    gf_mat = cache.GetLocalToWorldTransform(prim)
+    return np.array(gf_mat, dtype=float).T
 
 
+# ── World-pose resolution ────────────────────────────────────────────────────
+def _resolve_world_pose(cfg: CameraConfig) -> np.ndarray:
+    """Prefer the saved calibration; fall back to the nominal lookat pose."""
+    path: Path = cfg.extrinsic_path
+    if path.exists():
+        T = np.load(path)["T_world_cam"]
+        print(f"[camera] Using calibrated extrinsic from {path}")
+        return T
 
+    warnings.warn(
+        f"No OAK-D extrinsic file at {path}. Using nominal pose; "
+        f"run scripts/calibrate_extrinsic.py to save a real one."
+    )
+    return lookat_to_T_world_cam(
+        cfg.nominal_position, cfg.nominal_lookat, cfg.nominal_up,
+    )
+
+
+def lookat_to_T_world_cam(
+    position: tuple[float, float, float] | np.ndarray,
+    lookat:   tuple[float, float, float] | np.ndarray,
+    up:       tuple[float, float, float] | np.ndarray,
+) -> np.ndarray:
+    """Build a 4x4 OpenCV-convention camera-in-world transform from the
+    (position, lookat, up) triple.
+
+    Camera axes (in world frame): +Z = forward (toward ``lookat``),
+    +X = right, +Y = down. With world-up = +Z, "down in image" is roughly
+    -world-up, so the y-axis is the down-cross-forward direction.
+    """
+    pos    = np.asarray(position, dtype=float)
+    lookat = np.asarray(lookat,   dtype=float)
+    up     = np.asarray(up,       dtype=float)
+
+    forward = lookat - pos
+    forward /= np.linalg.norm(forward)
+
+    right = np.cross(forward, up)
+    n = np.linalg.norm(right)
+    if n < 1e-9:
+        raise ValueError("nominal lookat direction is parallel to nominal up vector")
+    right /= n
+
+    down = np.cross(forward, right)
+
+    R = np.column_stack([right, down, forward])    # columns = camera axes in world
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3]  = pos
+    return T
+
+
+# ── Internal helpers ─────────────────────────────────────────────────────────
+def _check_intrinsics(K: dict) -> None:
+    missing = [k for k in ("fx", "fy", "cx", "cy") if K.get(k, 0.0) == 0.0]
+    if missing:
+        raise ValueError(
+            f"OAK-D intrinsics keys {missing} are zero. Fill "
+            f"SceneConfig.camera.intrinsics from the factory calibration "
+            f"JSON before running."
+        )
+
+
+def _camel(name: str) -> str:
+    """Convert ``foo_bar_baz`` → ``FooBarBaz`` for use as a prim path segment."""
+    return "".join(part.capitalize() for part in name.split("_"))
