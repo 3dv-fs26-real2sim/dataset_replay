@@ -9,20 +9,22 @@ import numpy as np
 
 # ── Path anchors ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parents[2]          # dataset_replay/
-DESCRIPTION_ROOT = PROJECT_ROOT.parent / "pandaorca_description"
 
-# USD scenes
-USD_PATH_SINGLE = DESCRIPTION_ROOT / "usd" / "pandaorca_single.usd"
-USD_PATH_DUAL   = DESCRIPTION_ROOT / "usd" / "pandaorca_dual.usd"
+# Robot USD asset (single-arm). In dual mode this asset is referenced twice —
+# once per side — by utils/scene.py, with no Y-mirroring. The legacy
+# pandaorca_*.usda scene files have been retired; the entire stage (ground,
+# table, light, physics, robot references) is now built in Python.
+ROBOT_ASSET_PATH = PROJECT_ROOT / "assets" / "orcav1b_franka_vmnt_v10_flattened.usd"
 
 # H5 data (default files per mode)
 H5_PATH_SINGLE = PROJECT_ROOT / "data" / "20250804_104715.h5"
 H5_PATH_DUAL   = PROJECT_ROOT / "data" / "20250829_180500.h5"
 
-# Lula IK assets
-LULA_DESCRIPTOR_PATH = DESCRIPTION_ROOT / "lula" / "fer_robot_descriptor.yaml"
-URDF_PATH_LEFT  = DESCRIPTION_ROOT / "urdf" / "fer_orcahand_left_extended.urdf"
-URDF_PATH_RIGHT = DESCRIPTION_ROOT / "urdf" / "fer_orcahand_right_extended.urdf"
+# Lula IK assets — minimal 7-DOF Franka arm chain (no meshes, no hand). One
+# URDF for both arms; left vs right is purely a runtime convention from the
+# H5 data and the wrapper-xform world placement.
+LULA_DESCRIPTOR_PATH = PROJECT_ROOT / "assets" / "lula" / "panda_arm_descriptor.yaml"
+URDF_PATH = PROJECT_ROOT / "assets" / "urdf" / "panda_arm.urdf"
 
 # Object meshes
 OBJECTS_DIR = PROJECT_ROOT / "objects"
@@ -56,9 +58,46 @@ OBJECT_POSE_DEFAULT_CAMERA = "aria"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 # ── Prim paths in the USD stage ───────────────────────────────────────────────
-FRANKA_LEFT_PATH  = "/World/fer_orcahand_left_extended"
-FRANKA_RIGHT_PATH = "/World/fer_orcahand_right_extended"
-TABLE_PRIM_PATH   = "/World/Cube"
+# Wrapper Xforms that reference ROBOT_ASSET_PATH/Root. These are the
+# articulation roots (PhysicsArticulationRootAPI is composed in via the
+# reference), so SingleArticulation should be created against these paths.
+FRANKA_LEFT_PATH  = "/World/RobotLeft"
+FRANKA_RIGHT_PATH = "/World/RobotRight"
+
+# Visible robot base (panda_link0). Used as the camera/object world-anchor
+# because the new USD has a non-zero internal offset between /Root and
+# panda_link0 — so the wrapper xform's world transform ≠ panda_link0's. The
+# extrinsics in CAMERA_CONFIGS were calibrated against the physical base
+# (panda_link0), so we anchor camera/object math here.
+FRANKA_LEFT_BASE_PATH  = f"{FRANKA_LEFT_PATH}/panda_link0"
+FRANKA_RIGHT_BASE_PATH = f"{FRANKA_RIGHT_PATH}/panda_link0"
+
+TABLE_PRIM_PATH = "/World/Cube"
+
+# Desired world position of panda_link0 for each arm — i.e., where the
+# visible base of the arm should sit. Mirrors the legacy pandaorca_dual
+# layout: arms are placed on the table top (z=1.0) symmetrically about Y=0.
+ROBOT_BASE_WORLD_POSITIONS = {
+    "right": (-0.262, -0.386, 1.0),
+    "left":  (-0.262,  0.386, 1.0),
+}
+
+# Internal translate of panda_link0 within ROBOT_ASSET_PATH/Root, read off
+# the asset USD. The wrapper xform translate is computed as
+# ``ROBOT_BASE_WORLD_POSITIONS[side] - PANDA_LINK0_INTERNAL_OFFSET`` so that
+# panda_link0 lands at the desired world position (rather than the wrapper
+# itself, which is an arbitrary internal reference frame in the asset).
+#
+# NOTE: If the asset USD is regenerated and this offset shifts, update
+# this constant. A quick sanity check: with `--mode single --camera aria`
+# the table should be visible just below the visible mounting block of
+# the right arm — if the robot floats above the table or sinks into it,
+# this constant is wrong.
+PANDA_LINK0_INTERNAL_OFFSET = (
+    -0.007610592991113663,
+    -0.00026992621133103967,
+    -0.4760153889656067,
+)
 
 # ── DOF counts ────────────────────────────────────────────────────────────────
 N_ARM_DOFS      = 7
@@ -95,12 +134,11 @@ HAND_JOINT_VALUES_INITIAL = np.array([0.0] * N_HAND_DOFS)
 HAND_HOME_JOINT_VALUES    = np.array([0.0] * N_HAND_DOFS)
 
 # ── IK configuration ─────────────────────────────────────────────────────────
-EE_FRAME_NAME_LEFT  = "fer_link8"
-EE_FRAME_NAME_RIGHT = "fer_link8"
+EE_FRAME_NAME = "panda_link8"
 
-# The EE wrist (as recorded in H5 data) is offset from fer_link8 in fer_link8's
-# local frame.  To position the EE wrist at a target, the IK must aim fer_link8
-# at: target_pos - R_fer_link8 @ EE_WRIST_OFFSET_IN_LINK8.
+# The EE wrist (as recorded in H5 data) is offset from panda_link8 in
+# panda_link8's local frame. To position the EE wrist at a target, the IK
+# must aim panda_link8 at: target_pos - R_link8 @ EE_WRIST_OFFSET_IN_LINK8.
 # Values provided by supervisors from Orcahand Wiki.
 EE_WRIST_OFFSET_IN_LINK8 = np.array([0.13, 0.0, 0.07])
 
@@ -115,7 +153,7 @@ WRIST_HOME_ROTATION = np.array([
 ], dtype=float)
 
 # H5 data uses a tool-frame convention where identity = hand pointing down.
-# The URDF fer_link7/8 frame has Rx(180°) when the hand points down.
+# The URDF panda_link7/8 frame has Rx(180°) when the hand points down.
 # Pre-multiply by Rx(180°) to convert from tool convention to URDF convention.
 #! Double-check this is correct. Looks correct visually but not verified.
 Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])  # Rx(180°) in wxyz
@@ -184,17 +222,18 @@ H5_DEFAULT_CAMERA = "aria"
 
 # ── Per-arm configuration ────────────────────────────────────────────────────
 # Indexed by side name.  Allows loop-based setup instead of if/else blocks.
+# Both sides share the same URDF + EE frame; the kinematic chain is identical.
 ARM_CONFIGS = {
     "right": {
         "prim_path": FRANKA_RIGHT_PATH,
-        "urdf_path": URDF_PATH_RIGHT,
-        "ee_frame": EE_FRAME_NAME_RIGHT,
+        "urdf_path": URDF_PATH,
+        "ee_frame": EE_FRAME_NAME,
         "hand_joint_names": HAND_RIGHT_JOINT_NAMES,
     },
     "left": {
         "prim_path": FRANKA_LEFT_PATH,
-        "urdf_path": URDF_PATH_LEFT,
-        "ee_frame": EE_FRAME_NAME_LEFT,
+        "urdf_path": URDF_PATH,
+        "ee_frame": EE_FRAME_NAME,
         "hand_joint_names": HAND_LEFT_JOINT_NAMES,
     },
 }

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from isaacsim import SimulationApp
 
-from .constants import USD_PATH_SINGLE, USD_PATH_DUAL, H5_PATH_SINGLE, H5_PATH_DUAL
+from .constants import H5_PATH_SINGLE, H5_PATH_DUAL
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
@@ -34,15 +34,6 @@ def create_app(args, width: int = 1280, height: int = 720) -> SimulationApp:
             "height": height,
         }
     )
-
-
-def resolve_usd_path(mode: str) -> Path:
-    """Return the USD scene path for the given mode ('single' or 'dual')."""
-    if mode == "single":
-        return USD_PATH_SINGLE
-    elif mode == "dual":
-        return USD_PATH_DUAL
-    raise ValueError(f"Invalid mode: {mode}")
 
 
 def resolve_h5_path(mode: str) -> Path:

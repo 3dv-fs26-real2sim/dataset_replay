@@ -24,14 +24,15 @@ def setup_recording(
 ):
     """Configure video recorders based on CLI flags.
 
-    This is a high-level helper that wires up ``setup_capture`` and
-    ``setup_sidebyside`` according to the recording-related argparse flags
-    (``--record-sim``, ``--record-comparison``, ``--no-fast-record``,
-    ``--h5-camera``).
+    This is a high-level helper that wires up ``setup_capture``,
+    ``setup_sidebyside``, and ``setup_overlay`` according to the recording-
+    related argparse flags (``--record-sim``, ``--record-sidebyside``,
+    ``--record-overlay``, ``--no-fast-record``, ``--h5-camera``).
 
     Args:
-        args: Parsed CLI args (must have ``record_sim``, ``record_comparison``,
-            ``no_fast_record``, ``h5_camera``, ``fps`` attributes).
+        args: Parsed CLI args (must have ``record_sim``, ``record_sidebyside``,
+            ``no_fast_record``, ``h5_camera``, ``fps`` attributes; may also
+            provide ``record_overlay`` as a comma-separated string of alphas).
         h5_path: ``Path`` to the H5 file (used for output naming and sbs source).
         n_frames: Total frame count.
         video_suffix: Descriptive suffix appended to output filenames
@@ -40,11 +41,15 @@ def setup_recording(
         app_height: Render height in pixels.
 
     Returns:
-        ``(recorder, sim_output_path, sbs_recorder, sbs_output_path)``.
+        ``(recorder, sim_output_path, sbs_recorder, sbs_output_path, overlay_recorders)``
+        where ``overlay_recorders`` is a list of recorder dicts (one per alpha).
     """
     from .constants import OUTPUT_DIR
 
-    needs_viewport_capture = args.record_sim or args.record_comparison
+    overlay_alphas = _parse_overlay_alphas(getattr(args, "record_overlay", None))
+    needs_viewport_capture = (
+        args.record_sim or args.record_sidebyside or bool(overlay_alphas)
+    )
     deferred = not args.no_fast_record
 
     recorder, sim_output_path = (None, None)
@@ -53,24 +58,56 @@ def setup_recording(
             video_name = f"{h5_path.stem}_replay_{video_suffix}.mp4"
             sim_output_path = OUTPUT_DIR / video_name
         else:
-            sim_output_path = None  # memory-only capture for sbs
+            sim_output_path = None  # memory-only capture for sbs / overlay
         recorder, sim_output_path = setup_capture(
             n_frames, sim_output_path,
             args.fps, app_width, app_height, deferred=deferred,
         )
 
     sbs_recorder, sbs_output_path = (None, None)
-    if args.record_comparison:
-        sbs_name = f"{h5_path.stem}_comparison_{video_suffix}.mp4"
+    if args.record_sidebyside:
+        sbs_name = f"{h5_path.stem}_sidebyside_{video_suffix}.mp4"
         sbs_recorder, sbs_output_path = setup_sidebyside(
             n_frames, OUTPUT_DIR / sbs_name,
             args.fps, app_width, app_height, h5_path, args.h5_camera,
         )
 
+    overlay_recorders = []
+    for alpha in overlay_alphas:
+        ov_name = f"{h5_path.stem}_overlay_a{alpha:.2f}_{video_suffix}.mp4"
+        ov_recorder, _ = setup_overlay(
+            n_frames, OUTPUT_DIR / ov_name,
+            args.fps, app_width, app_height, h5_path, args.h5_camera, alpha,
+        )
+        if ov_recorder is not None:
+            overlay_recorders.append(ov_recorder)
+
     if not needs_viewport_capture:
         print("[capture] No recording flags set.")
 
-    return recorder, sim_output_path, sbs_recorder, sbs_output_path
+    return recorder, sim_output_path, sbs_recorder, sbs_output_path, overlay_recorders
+
+
+def _parse_overlay_alphas(spec) -> list[float]:
+    """Parse the comma-separated --record-overlay string into a list of floats.
+
+    Values outside [0, 1] or unparsable tokens are rejected with ValueError.
+    Returns an empty list when ``spec`` is None or empty.
+    """
+    if spec is None:
+        return []
+    alphas = []
+    for token in str(spec).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        value = float(token)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"--record-overlay alpha must be in [0, 1]; got {value}"
+            )
+        alphas.append(value)
+    return alphas
 
 
 def setup_capture(
@@ -288,6 +325,82 @@ def capture_sidebyside_frame(recorder, sim_frame, frame_idx: int) -> bool:
 
 
 def close_sidebyside(recorder) -> None:
+    """Encode deferred frames, close the writer and H5 file handle."""
+    if recorder is None:
+        return
+    _encode_deferred_frames(recorder)
+    recorder["writer"].close()
+    recorder["h5_file"].close()
+
+
+# ── Overlay (alpha-blended sim + H5) capture ─────────────────────────────────
+
+
+def setup_overlay(
+    total_frames, output_path, fps,
+    sim_width, sim_height, h5_path, h5_camera, alpha: float,
+):
+    """Set up overlay capture: alpha-blend Isaac Sim viewport with H5 frame.
+
+    The output is written at simulation resolution; the H5 frame is resized to
+    match before blending. ``alpha`` is the sim's opacity in [0, 1]:
+    ``alpha=1`` keeps the sim only, ``alpha=0`` keeps the H5 frame only.
+
+    Returns:
+        (recorder_dict, output_path) or (None, None) if H5 camera data is missing.
+    """
+    from .h5_loader import open_h5_images
+
+    h5_file, h5_dataset = open_h5_images(h5_path, h5_camera)
+    if h5_file is None:
+        print(f"[overlay] Cannot set up overlay: camera '{h5_camera}' not in {h5_path}")
+        return None, None
+
+    out_w = sim_width + sim_width % 2
+    out_h = sim_height + sim_height % 2
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = imageio.get_writer(str(output_path), fps=max(1, int(round(fps))), codec="libx264")
+    print(f"[overlay] Recording overlay to {output_path} "
+          f"(alpha={alpha:.2f}, {out_w}x{out_h}, {total_frames} frames target)")
+
+    return {
+        "writer": writer,
+        "output_path": output_path,
+        "h5_file": h5_file,
+        "h5_dataset": h5_dataset,
+        "alpha": float(alpha),
+        "out_w": out_w,
+        "out_h": out_h,
+        "frames": [],
+        "frames_written": 0,
+    }, output_path
+
+
+def capture_overlay_frame(recorder, sim_frame, frame_idx: int) -> bool:
+    """Blend ``sim_frame`` with the matching H5 frame and buffer for encoding."""
+    if recorder is None or sim_frame is None:
+        return False
+
+    ds = recorder["h5_dataset"]
+    idx = min(frame_idx, ds.shape[0] - 1)
+    h5_frame = ds[idx]
+
+    out_h, out_w = recorder["out_h"], recorder["out_w"]
+    sim_r = _resize_to_height(sim_frame, out_h, out_w)
+    h5_r = _resize_to_height(h5_frame, out_h, out_w)
+
+    alpha = recorder["alpha"]
+    blended = (
+        alpha * sim_r.astype(np.float32) + (1.0 - alpha) * h5_r.astype(np.float32)
+    ).clip(0, 255).astype(np.uint8)
+
+    recorder["frames"].append(blended)
+    recorder["frames_written"] += 1
+    return True
+
+
+def close_overlay(recorder) -> None:
     """Encode deferred frames, close the writer and H5 file handle."""
     if recorder is None:
         return

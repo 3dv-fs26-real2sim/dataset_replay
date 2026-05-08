@@ -22,6 +22,7 @@ def load_object_world_trajectory(
     mode: str,
     right_prim_path: str,
     object_pose_version: str | None = None,
+    T_world_cam_override=None,
 ):
     """Load an object's 6D pose trajectory and transform it to world frame.
 
@@ -40,6 +41,11 @@ def load_object_world_trajectory(
         object_pose_version: Pose-trajectory version key (e.g. ``"vda"``,
             ``"depthpro"``).  Ignored when ``object_poses_override`` is set.
             When ``None``, falls back to ``OBJECT_POSE_DEFAULT_VERSION``.
+        T_world_cam_override: Optional 4x4 camera-in-world pose. When supplied,
+            bypasses the nominal base-to-camera extrinsics and uses this pose
+            to map the camera-frame trajectory into world frame — used by
+            ``kinematic_replay.py --refined-extrinsic`` so the viewport
+            camera and the object trajectory share the same world frame.
 
     Returns:
         ``(N, 4, 4)`` array of world-frame transforms, or ``None`` if the
@@ -71,12 +77,20 @@ def load_object_world_trajectory(
     print(f"[object] Loaded {traj_cam.shape[0]} poses from {npz_path}")
 
     # Camera frame -> world frame.
-    cam_cfg = CAMERA_CONFIGS[object_pose_camera]
-    T_world_cam = compute_camera_world_pose(
-        stage, cam_cfg["extrinsics"],
-        left_prim_path=None,  # single mode
-        right_prim_path=right_prim_path,
-    )
+    if T_world_cam_override is not None:
+        T_world_cam = np.asarray(T_world_cam_override, dtype=float)
+        if T_world_cam.shape != (4, 4):
+            raise ValueError(
+                f"T_world_cam_override must be 4x4, got {T_world_cam.shape}"
+            )
+        print("[object] Using refined T_world_cam for camera→world trajectory mapping")
+    else:
+        cam_cfg = CAMERA_CONFIGS[object_pose_camera]
+        T_world_cam = compute_camera_world_pose(
+            stage, cam_cfg["extrinsics"],
+            left_prim_path=None,  # single mode
+            right_prim_path=right_prim_path,
+        )
     traj_world = transform_trajectory(T_world_cam, traj_cam)
 
     if traj_world.shape[0] != n_frames:

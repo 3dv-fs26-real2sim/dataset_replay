@@ -1,6 +1,6 @@
 import argparse
 
-from utils.app import add_common_args, create_app, resolve_usd_path, resolve_h5_path
+from utils.app import add_common_args, create_app, resolve_h5_path
 # constants.py / poses.py have no Isaac Sim deps — safe to import before SimulationApp.
 from utils.constants import (
     CAMERA_CONFIGS, H5_IMAGE_PATHS, H5_DEFAULT_CAMERA,
@@ -19,6 +19,13 @@ parser.add_argument(
 parser.add_argument(
     "--camera", type=str, default="aria", choices=list(CAMERA_CONFIGS.keys()),
     help="Set viewport to a calibrated camera (default: aria)",
+)
+parser.add_argument(
+    "--refined-extrinsic", type=str, default=None,
+    help="Path to an NPZ produced by scripts/refine_camera_extrinsic.py. "
+         "When set, its 'T_world_cam' overrides the nominal camera pose "
+         "computed from CAMERA_CONFIGS — applied to both the viewport "
+         "camera and the object-trajectory world frame so they stay aligned.",
 )
 
 # ── Object spawning + 6D pose trajectory ────────────────────────────────────
@@ -56,13 +63,20 @@ parser.add_argument(
     help="Record Isaac Sim viewport to MP4",
 )
 parser.add_argument(
-    "--record-comparison", action="store_true",
+    "--record-sidebyside", action="store_true",
     help="Record side-by-side comparison (Isaac Sim left, H5 original right)",
+)
+parser.add_argument(
+    "--record-overlay", type=str, nargs="?", default=None, const="0.3,0.5,0.7",
+    help="Record alpha-blended overlay of Isaac Sim and H5 video. Accepts a "
+         "comma-separated list of sim-opacity values in [0, 1] (one output MP4 "
+         "per value). Bare flag defaults to '0.3,0.5,0.7'.",
 )
 parser.add_argument(
     "--h5-camera", type=str, default=H5_DEFAULT_CAMERA,
     choices=list(H5_IMAGE_PATHS.keys()),
-    help=f"Which H5 camera to use for --record-comparison (default: {H5_DEFAULT_CAMERA})",
+    help=f"Which H5 camera to use for --record-sidebyside / --record-overlay "
+         f"(default: {H5_DEFAULT_CAMERA})",
 )
 parser.add_argument(
     "--no-fast-record", action="store_true",
@@ -91,19 +105,22 @@ simulation_app = create_app(args, width=APP_WIDTH, height=APP_HEIGHT)
 
 # Isaac Sim imports must come after SimulationApp creation.
 import numpy as np
-import omni.usd
 from isaacsim.core.api import World
 
-from utils.constants import FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH, OBJECTS_DIR
+from utils.constants import (
+    FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH, OBJECTS_DIR,
+)
 from utils.rotation import detect_quaternion_order
 from utils.h5_loader import load_h5
 from utils.robot import add_articulations, setup_arms_ik
 from utils.capture import (
     setup_recording, capture_frame_to_writer, close_recorder,
     capture_sidebyside_frame, close_sidebyside,
+    capture_overlay_frame, close_overlay,
 )
 from utils.camera import setup_camera
 from utils.object import load_object_world_trajectory, spawn_object, set_object_world_pose
+from utils.scene import build_scene
 
 
 # ── Helper functions ────────────────────────────────────────────────────────
@@ -132,7 +149,7 @@ def _build_video_suffix(args) -> str:
     return "_".join(parts)
 
 
-def _setup_object_replay(args, stage, n_frames):
+def _setup_object_replay(args, stage, n_frames, T_world_cam_override=None):
     """Spawn the chosen object and prepare its world-frame pose trajectory.
 
     Returns ``(prim_path, traj_world)`` where ``traj_world`` is an ``(N, 4, 4)``
@@ -142,8 +159,9 @@ def _setup_object_replay(args, stage, n_frames):
     traj_world = load_object_world_trajectory(
         stage, args.object, args.object_poses,
         args.object_pose_camera, n_frames,
-        args.mode, FRANKA_RIGHT_PATH,
+        args.mode, FRANKA_RIGHT_BASE_PATH,
         object_pose_version=args.object_pose_version,
+        T_world_cam_override=T_world_cam_override,
     )
     if traj_world is None:
         return None, None
@@ -181,32 +199,79 @@ def main():
     print(f"[debug]   Quaternion (wxyz): {sample[3:]}")
     print(f"[debug]   Quaternion norm: {np.linalg.norm(sample[3:]):.4f}")
 
-    # Load USD scene.
-    omni.usd.get_context().open_stage(str(resolve_usd_path(args.mode)))
+    # Build the scene programmatically (ground, table, light, physics, robots).
+    # Robot collisions are disabled because joint positions are teleported each
+    # frame — leaving them on lets PhysX integrate spurious contact forces.
+    stage = build_scene(args.mode, robot_collision=False)
 
     world = World()
     arms = add_articulations(world, args.mode)
     world.reset()
     setup_arms_ik(arms)
 
+    # Resolve the optional refined extrinsic once, before it's needed by either
+    # the object trajectory (camera→world mapping) or the viewport camera.
+    # The same T_world_cam must be used for both, otherwise the rendered object
+    # would drift relative to the refined camera by the refinement delta
+    # (typically 60-100 mm in world frame for the Aria extrinsic).
+    refined_T_world_cam = None
+    refined_camera_name = None
+    if args.refined_extrinsic is not None:
+        from pathlib import Path as _Path
+        ref_path = _Path(args.refined_extrinsic)
+        with np.load(ref_path) as _ref:
+            if "T_world_cam" not in _ref.files:
+                raise SystemExit(
+                    f"{ref_path} missing required key 'T_world_cam' "
+                    f"(found: {_ref.files})"
+                )
+            refined_T_world_cam = _ref["T_world_cam"]
+            refined_camera_name = str(_ref["camera"]) if "camera" in _ref.files else None
+        print(f"[refine] Loaded refined extrinsic from {ref_path} "
+              f"(camera={refined_camera_name})")
+        with np.printoptions(precision=6, suppress=True):
+            print(f"[refine] T_world_cam =\n{refined_T_world_cam}")
 
-    stage = omni.usd.get_context().get_stage()
+    # Apply the override to the object trajectory only when the refinement
+    # camera matches --object-pose-camera (otherwise fall back to nominal).
+    object_override = (
+        refined_T_world_cam
+        if refined_camera_name is None or refined_camera_name == args.object_pose_camera
+        else None
+    )
+    if refined_T_world_cam is not None and object_override is None:
+        print(f"[refine] Skipping object-trajectory override — refinement camera "
+              f"'{refined_camera_name}' != --object-pose-camera '{args.object_pose_camera}'")
 
     # Spawn the trajectory-driven object (single mode only) and load its
     # world-frame pose trajectory. Must happen after world.reset() so the
     # robot bases have valid world transforms for camera-frame conversion.
-    object_prim_path, object_traj_world = _setup_object_replay(args, stage, n_frames)
+    object_prim_path, object_traj_world = _setup_object_replay(
+        args, stage, n_frames, T_world_cam_override=object_override,
+    )
 
     if args.camera is not None:
+        # Apply the override to the viewport camera only when its name matches
+        # the refinement camera.
+        camera_override = (
+            refined_T_world_cam
+            if refined_camera_name is None or refined_camera_name == args.camera
+            else None
+        )
+        if refined_T_world_cam is not None and camera_override is None:
+            print(f"[refine] Skipping viewport-camera override — refinement camera "
+                  f"'{refined_camera_name}' != --camera '{args.camera}'")
+
         camera_prim_path = setup_camera(
             stage, args.camera, args.mode,
-            FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
+            FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH,
+            world_pose_override=camera_override,
         )
         print(f"[camera] Viewport set to {camera_prim_path}")
 
     # ── Video capture setup ─────────────────────────────────────────────────
     suffix = _build_video_suffix(args)
-    recorder, sim_output_path, sbs_recorder, sbs_output_path = (
+    recorder, sim_output_path, sbs_recorder, sbs_output_path, overlay_recorders = (
         setup_recording(args, h5_path, n_frames, suffix, APP_WIDTH, APP_HEIGHT)
     )
     captured_frames = 0
@@ -235,6 +300,8 @@ def main():
                 captured_frames += 1
                 if sbs_recorder is not None:
                     capture_sidebyside_frame(sbs_recorder, recorder["last_frame"], frame_idx)
+                for ov in overlay_recorders:
+                    capture_overlay_frame(ov, recorder["last_frame"], frame_idx)
 
             if frame_idx % 100 == 0:
                 pct = 100 * frame_idx / n_frames
@@ -255,8 +322,13 @@ def main():
 
     close_sidebyside(sbs_recorder)
     if sbs_recorder is not None:
-        print(f"[capture] Saved comparison to {sbs_output_path} "
+        print(f"[capture] Saved side-by-side to {sbs_output_path} "
               f"({sbs_recorder['frames_written']} frames)")
+
+    for ov in overlay_recorders:
+        close_overlay(ov)
+        print(f"[capture] Saved overlay to {ov['output_path']} "
+              f"(alpha={ov['alpha']:.2f}, {ov['frames_written']} frames)")
 
     print("[replay] Done.")
     simulation_app.close()

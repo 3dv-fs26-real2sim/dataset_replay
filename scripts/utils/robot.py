@@ -34,46 +34,17 @@ def print_dof_info(label: str, art: SingleArticulation) -> None:
 def resolve_dof_indices(
     art: SingleArticulation, names: list[str], label: str
 ) -> np.ndarray:
-    """Map canonical joint names to articulation DOF indices.
-
-    Supports alias matching (panda_joint ↔ fer_joint) and suffix matching as fallback.
-    """
+    """Map canonical joint names to articulation DOF indices."""
     dof_names = list(art.dof_names)
     name_to_idx = {n: i for i, n in enumerate(dof_names)}
 
-    def candidate_names(name: str) -> list[str]:
-        if name.startswith("panda_joint"):
-            return [name, name.replace("panda_joint", "fer_joint", 1)]
-        if name.startswith("fer_joint"):
-            return [name, name.replace("fer_joint", "panda_joint", 1)]
-        return [name]
-
     indices = []
     for name in names:
-        resolved = False
-        for cand in candidate_names(name):
-            if cand in name_to_idx:
-                if cand != name:
-                    print(f"[DOF] '{name}' matched via alias '{cand}'")
-                indices.append(name_to_idx[cand])
-                resolved = True
-                break
-        if resolved:
-            continue
-
-        matches = [dof for dof in dof_names if dof.endswith(name)]
-        if len(matches) == 1:
-            print(f"[DOF] '{name}' matched via suffix to '{matches[0]}'")
-            indices.append(name_to_idx[matches[0]])
-        elif len(matches) > 1:
-            raise RuntimeError(
-                f"[DOF] Ambiguous suffix match for '{name}' in {label}: {matches}"
-            )
-        else:
+        if name not in name_to_idx:
             raise RuntimeError(
                 f"[DOF] Cannot find '{name}' in {label} DOFs: {dof_names}"
             )
-
+        indices.append(name_to_idx[name])
     return np.array(indices, dtype=int)
 
 
@@ -98,7 +69,7 @@ def setup_arms_ik(arms: dict) -> None:
     Modifies ``arms`` in-place, adding ``"set_positions"`` to each entry.
     """
     home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
-    home_fer_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
+    home_link8_pos = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
 
     for side, arm in arms.items():
         cfg = arm["config"]
@@ -108,12 +79,12 @@ def setup_arms_ik(arms: dict) -> None:
 
         home_arm_joints, _ = solve_ik_for_pose(
             ik_solver, cfg["ee_frame"],
-            home_fer_link8_pos, home_wrist_quat,
+            home_link8_pos, home_wrist_quat,
         )
         if home_arm_joints is None:
             raise RuntimeError(
                 f"IK failed for {side} arm home wrist pose "
-                f"(fer_link8_pos={home_fer_link8_pos}, quat={home_wrist_quat}). "
+                f"(link8_pos={home_link8_pos}, quat={home_wrist_quat}). "
                 f"Check ee_frame='{cfg['ee_frame']}' and the Lula descriptor."
             )
         print(f"[IK] Home arm joints {side.upper():5s} (rad): {home_arm_joints}")

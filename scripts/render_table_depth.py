@@ -20,9 +20,10 @@ import argparse
 
 import numpy as np
 
-from utils.app import add_common_args, create_app, resolve_usd_path
+from utils.app import add_common_args, create_app
 from utils.constants import (
-    CAMERA_CONFIGS, FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH, OUTPUT_DIR,
+    CAMERA_CONFIGS, FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
+    FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH, OUTPUT_DIR,
 )
 
 NUM_WARMUP_FRAMES = 10
@@ -63,22 +64,21 @@ render_height = intrinsics["height"]  # 480
 simulation_app = create_app(args, width=render_width, height=render_height)
 
 # ── Isaac Sim imports (must come after SimulationApp creation) ───────────────
-import omni.usd                                     # noqa: E402
 import omni.replicator.core as rep                   # noqa: E402
 from pxr import UsdGeom                              # noqa: E402
 
 from utils.camera import setup_camera                # noqa: E402
+from utils.scene import build_scene                  # noqa: E402
 
 
 def main():
-    # ── 1. Open USD scene ────────────────────────────────────────────────────
-    omni.usd.get_context().open_stage(str(resolve_usd_path(args.mode)))
-    stage = omni.usd.get_context().get_stage()
+    # ── 1. Build scene programmatically ──────────────────────────────────────
+    stage = build_scene(args.mode)
 
     # ── 2. Setup calibrated camera ───────────────────────────────────────────
     camera_prim_path = setup_camera(
         stage, args.camera, args.mode,
-        FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
+        FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH,
     )
     print(f"[camera] Viewport set to {camera_prim_path}")
 

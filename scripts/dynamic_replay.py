@@ -6,7 +6,7 @@ Does not work. We need a better idea for how to do dynamic replay with physics i
 
 import argparse
 
-from utils.app import add_common_args, create_app, resolve_usd_path, resolve_h5_path
+from utils.app import add_common_args, create_app, resolve_h5_path
 # constants.py / poses.py have no Isaac Sim deps — safe to import before SimulationApp.
 from utils.constants import (
     CAMERA_CONFIGS, H5_IMAGE_PATHS, H5_DEFAULT_CAMERA,
@@ -79,13 +79,13 @@ parser.add_argument(
     help="Record Isaac Sim viewport to MP4",
 )
 parser.add_argument(
-    "--record-comparison", action="store_true",
+    "--record-sidebyside", action="store_true",
     help="Record side-by-side comparison (Isaac Sim left, H5 original right)",
 )
 parser.add_argument(
     "--h5-camera", type=str, default=H5_DEFAULT_CAMERA,
     choices=list(H5_IMAGE_PATHS.keys()),
-    help=f"Which H5 camera to use for --record-comparison (default: {H5_DEFAULT_CAMERA})",
+    help=f"Which H5 camera to use for --record-sidebyside (default: {H5_DEFAULT_CAMERA})",
 )
 parser.add_argument(
     "--no-fast-record", action="store_true",
@@ -114,10 +114,11 @@ simulation_app = create_app(args, width=APP_WIDTH, height=APP_HEIGHT)
 
 # Isaac Sim imports must come after SimulationApp creation.
 import numpy as np
-import omni.usd
 from isaacsim.core.api import World
 
-from utils.constants import FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH, OBJECTS_DIR
+from utils.constants import (
+    FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH, OBJECTS_DIR,
+)
 from utils.rotation import detect_quaternion_order
 from utils.h5_loader import load_h5
 from utils.robot import add_articulations, setup_arms_ik
@@ -126,6 +127,7 @@ from utils.capture import (
     capture_sidebyside_frame, close_sidebyside,
 )
 from utils.camera import setup_camera
+from utils.scene import build_scene
 from pxr import UsdPhysics as _UsdPhysics
 from utils.object import (
     load_object_world_trajectory, spawn_object, set_object_world_pose,
@@ -170,7 +172,7 @@ def _setup_dynamic_object_replay(args, stage, n_frames):
     traj_world = load_object_world_trajectory(
         stage, args.object, args.object_poses,
         args.object_pose_camera, n_frames,
-        args.mode, FRANKA_RIGHT_PATH,
+        args.mode, FRANKA_RIGHT_BASE_PATH,
         object_pose_version=args.object_pose_version,
     )
     if traj_world is None:
@@ -222,15 +224,13 @@ def main():
     print(f"[debug]   Quaternion (wxyz): {sample[3:]}")
     print(f"[debug]   Quaternion norm: {np.linalg.norm(sample[3:]):.4f}")
 
-    # Load USD scene.
-    omni.usd.get_context().open_stage(str(resolve_usd_path(args.mode)))
+    # Build the scene programmatically (ground, table, light, physics, robots).
+    stage = build_scene(args.mode)
 
     world = World()
     arms = add_articulations(world, args.mode)
     world.reset()
     setup_arms_ik(arms)
-
-    stage = omni.usd.get_context().get_stage()
 
     # Spawn the dynamic object with D6 tracking joint (single mode only).
     # Must happen after world.reset() so the robot bases have valid world
@@ -242,13 +242,13 @@ def main():
     if args.camera is not None:
         camera_prim_path = setup_camera(
             stage, args.camera, args.mode,
-            FRANKA_LEFT_PATH, FRANKA_RIGHT_PATH,
+            FRANKA_LEFT_BASE_PATH, FRANKA_RIGHT_BASE_PATH,
         )
         print(f"[camera] Viewport set to {camera_prim_path}")
 
     # ── Video capture setup ─────────────────────────────────────────────────
     suffix = _build_video_suffix(args)
-    recorder, sim_output_path, sbs_recorder, sbs_output_path = (
+    recorder, sim_output_path, sbs_recorder, sbs_output_path, _overlay_recorders = (
         setup_recording(args, h5_path, n_frames, suffix, APP_WIDTH, APP_HEIGHT)
     )
     captured_frames = 0
@@ -297,7 +297,7 @@ def main():
 
     close_sidebyside(sbs_recorder)
     if sbs_recorder is not None:
-        print(f"[capture] Saved comparison to {sbs_output_path} "
+        print(f"[capture] Saved side-by-side to {sbs_output_path} "
               f"({sbs_recorder['frames_written']} frames)")
 
     print("[replay] Done.")

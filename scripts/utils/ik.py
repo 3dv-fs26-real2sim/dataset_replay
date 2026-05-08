@@ -60,7 +60,7 @@ def make_ik_position_setter(
     """Return a callable that solves IK for each wrist pose and sets joint positions.
 
     Args:
-        ee_wrist_offset: offset from ee_frame (e.g. fer_link8) to the EE wrist in
+        ee_wrist_offset: offset from ee_frame (e.g. panda_link8) to the EE wrist in
             the frame's local coordinates.  When provided, the IK target position
             is shifted so that the physical EE wrist lands on the requested pose:
             ``ik_position = ee_wrist_pos - R_frame @ ee_wrist_offset``.
@@ -83,7 +83,7 @@ def make_ik_position_setter(
                         URDF convention via Rx(180°) before IK.  If
                         ``ee_wrist_offset`` was supplied at construction time,
                         the IK target is shifted from the EE wrist to the
-                        ee_frame origin (e.g. fer_link8).
+                        ee_frame origin (e.g. panda_link8).
             q_hand: hand joint angle offsets (added to hand_home).
         """
         position = wrist_pose[:3]
