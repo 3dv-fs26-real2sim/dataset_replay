@@ -153,6 +153,61 @@ def open_h5_images(path: str | Path, camera: str = H5Reader.DEFAULT_CAMERA):
     return f, f[key]
 
 
+def read_h5_intrinsic(
+    path: str | Path,
+    camera: str = H5Reader.DEFAULT_CAMERA,
+) -> np.ndarray:
+    """Return the 3×3 camera intrinsic matrix stored in an H5, or raise.
+
+    Looks under ``observations/images/{camera}/intrinsics`` (shape (9,)).
+    """
+    key = f"observations/images/{camera}/intrinsics"
+    with h5py.File(path, "r") as f:
+        if key not in f:
+            raise KeyError(f"H5 file lacks {key!r}")
+        return np.array(f[key]).reshape(3, 3).astype(float)
+
+
+def read_h5_extrinsic(
+    path: str | Path,
+    camera: str = H5Reader.DEFAULT_CAMERA,
+    *,
+    mount_xyz: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+    mount_rpy: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Return the camera's 4×4 T_world_cam given the recorded T_robot_cam.
+
+    The H5 stores ``observations/images/{camera}/extrinsics`` (shape (16,))
+    as a flattened row-major 4×4. Per inspection of the dataset format this
+    is ``T_robot_cam`` — the camera's pose in the panda_link0 frame.
+
+    To convert to world frame we compose it with ``T_world_robot``, the
+    wrapper transform that places ``panda_link0`` at ``mount_xyz`` (with
+    optional XYZ-extrinsic Euler rotation ``mount_rpy``)::
+
+        T_world_cam = T_world_robot @ T_robot_cam
+
+    Both ``mount_xyz`` and ``mount_rpy`` should match
+    ``SceneConfig.robot.mount_xyz`` / ``mount_rpy`` for the converted pose
+    to align with the simulated robot.
+    """
+    key = f"observations/images/{camera}/extrinsics"
+    with h5py.File(path, "r") as f:
+        if key not in f:
+            raise KeyError(f"H5 file lacks {key!r}")
+        T_robot_cam = np.array(f[key]).reshape(4, 4).astype(float)
+
+    T_world_robot = np.eye(4)
+    T_world_robot[:3, 3] = np.asarray(mount_xyz, dtype=float)
+    if any(r != 0.0 for r in mount_rpy):
+        from scipy.spatial.transform import Rotation
+        T_world_robot[:3, :3] = Rotation.from_euler(
+            "XYZ", mount_rpy
+        ).as_matrix()
+
+    return T_world_robot @ T_robot_cam
+
+
 def peek_schema(path: str | Path, max_depth: int = 4) -> None:
     """Print the dataset hierarchy of an H5 file. Useful for adapting
     :class:`H5Reader`'s schema constants to a new dataset format.

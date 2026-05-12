@@ -25,12 +25,27 @@ _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
 # ── Public API ───────────────────────────────────────────────────────────────
 def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
-                 *, prim_path: str | None = None) -> str:
+                 *, prim_path: str | None = None,
+                 world_pose_override: np.ndarray | None = None) -> str:
     """Create a UsdGeom.Camera at the calibrated (or nominal) world pose and
-    set it as the active viewport camera. Returns the camera prim path."""
+    set it as the active viewport camera. Returns the camera prim path.
+
+    If ``world_pose_override`` is supplied, it is used verbatim — bypassing
+    the saved-extrinsic file and the nominal lookat fallback. Useful for
+    plugging in a T_world_cam computed from an H5 dataset's stored
+    extrinsics (see ``utils.h5_loader.read_h5_extrinsic``).
+    """
     _check_intrinsics(cfg.intrinsics)
 
-    world_pose = _resolve_world_pose(cfg)
+    if world_pose_override is not None:
+        world_pose = np.asarray(world_pose_override, dtype=float)
+        if world_pose.shape != (4, 4):
+            raise ValueError(
+                f"world_pose_override must be 4×4, got {world_pose.shape}"
+            )
+        print(f"[camera] {cfg.name}: using world_pose_override")
+    else:
+        world_pose = _resolve_world_pose(cfg)
     pos = world_pose[:3, 3]
     print(f"[camera] {cfg.name}: world position [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 

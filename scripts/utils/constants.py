@@ -16,6 +16,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]   # dataset_replay/
 OUTPUT_DIR   = PROJECT_ROOT / "outputs"
 
 
+# ── Capture rate ──────────────────────────────────────────────────────────────
+# Frame rate at which the current generation of H5 datasets is recorded.
+# All replay / capture scripts default to this so MP4 outputs play back at
+# the same speed as the source recording. Older 50 Hz datasets exist (e.g.
+# the `*_50hz` files referenced in README §1); override via the shared
+# ``--fps`` CLI flag (added by ``utils.app.add_common_args``) when you
+# replay one of those.
+H5_DEFAULT_FPS = 10.0   # Hz — H5 capture / MP4 output frame rate.
+
+
 # ── Prim paths ────────────────────────────────────────────────────────────────
 # Wrapper Xform that references the orcav1b USD's /Root. PhysicsArticulationRootAPI
 # is composed in via the reference, so SingleArticulation should be created

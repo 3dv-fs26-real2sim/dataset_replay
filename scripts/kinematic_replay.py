@@ -4,13 +4,24 @@ Loads a wrist+hand trajectory from H5, solves IK per frame, drives the
 articulation kinematically, and (optionally) replays a kinematic object
 trajectory in world frame.
 
-Usage:
+Usage::
+
     python scripts/kinematic_replay.py --h5 data/h5/session.h5
     python scripts/kinematic_replay.py --h5 ... --object duck --object-traj data/poses/foo.npz
+    python scripts/kinematic_replay.py --h5 ... --record-sim
+    python scripts/kinematic_replay.py --h5 ... --record-sidebyside --record-overlay 0.3 0.6
 
-NOTE: The H5 schema is currently a stub (see utils/h5_loader.py). When the
-new dataset format lands, update ``H5Reader.ARM_KEY``/``HAND_KEY``/
-``IMAGE_KEY_FMT`` to match — the rest of this script needs no change.
+By default the camera world pose is loaded from the calibrated extrinsic
+file at ``CameraConfig.extrinsic_path`` (typically the AprilTag-PnP output
+of ``scripts/calibrate_extrinsic.py``). Pass ``--use-h5-extrinsic`` to
+instead compose the H5-stored ``T_robot_cam`` with the configured
+``robot.mount_xyz`` — this matches the recording-time pose stored in the
+H5 and is mainly useful as a diagnostic; the saved ``.npz`` is the
+canonical source of truth (see ``utils.calibration`` and the project
+calibration source-of-truth note). When the H5 file lacks a stored
+extrinsic, ``--use-h5-extrinsic`` silently falls back to the same
+``.npz`` chain. Matches the convention used by ``test_setup.py`` and
+``visualize_calibration.py``.
 """
 
 from __future__ import annotations
@@ -34,7 +45,8 @@ parser = argparse.ArgumentParser(description=__doc__,
 add_common_args(parser)
 parser.add_argument("--h5", type=Path, required=True,
                     help="Path to the H5 trajectory file")
-parser.add_argument("--camera-name", type=str, default=H5Reader.DEFAULT_CAMERA,
+parser.add_argument("--h5-camera", "--camera-name", dest="h5_camera",
+                    type=str, default=H5Reader.DEFAULT_CAMERA,
                     help=f"Image dataset key in H5 (default: {H5Reader.DEFAULT_CAMERA})")
 parser.add_argument("--object", type=str, default=None,
                     help="Object name to spawn (folder under objects/)")
@@ -44,21 +56,41 @@ parser.add_argument("--object-scale", type=float, default=0.1,
                     help="Object scale (default: 0.1)")
 parser.add_argument("--no-camera", action="store_true",
                     help="Skip OAK-D camera setup")
+parser.add_argument("--use-h5-extrinsic", action="store_true",
+                    help="Use the H5-stored T_robot_cam (composed with "
+                         "cfg.robot.mount_xyz) as T_world_cam, instead of "
+                         "the calibrated .npz at cfg.camera.extrinsic_path. "
+                         "Diagnostic only — see project notes on calibration "
+                         "source-of-truth.")
 
-# Recording flags are accepted but their wiring lands in Phase 7 (when the
-# new H5 schema is concrete and we know how to overlay the H5 image stream).
-parser.add_argument("--record-sim", action="store_true")
-parser.add_argument("--record-sidebyside", action="store_true")
+# Recording flags. Capture wiring requires --no-camera off and a viewport.
+parser.add_argument("--record-sim", action="store_true",
+                    help="Save the Isaac Sim viewport as <h5stem>_replay_<suffix>.mp4")
+parser.add_argument("--record-sidebyside", action="store_true",
+                    help="Save sim+H5 side-by-side as <h5stem>_sidebyside_<suffix>.mp4")
 parser.add_argument("--record-overlay", nargs="*", type=float, default=None,
-                    help="Overlay alpha(s) in (0, 1) — pass one or more values")
+                    help="Alpha-blend sim+H5; pass one or more alphas in (0, 1).")
+parser.add_argument("--no-fast-record", action="store_true",
+                    help="Encode each frame inline (slower but lower memory).")
 
 args = parser.parse_args()
 
 # ── Boot Isaac Sim FIRST ─────────────────────────────────────────────────────
-simulation_app = create_app(args)
+APP_W, APP_H = 1280, 720
+simulation_app = create_app(args, width=APP_W, height=APP_H)
 
 from isaacsim.core.api import World                          # noqa: E402
 
+from utils.capture import (                                  # noqa: E402
+    capture_frame_to_writer,
+    capture_overlay_frame,
+    capture_sidebyside_frame,
+    close_overlay,
+    close_recorder,
+    close_sidebyside,
+    setup_recording,
+)
+from utils.h5_loader import read_h5_extrinsic                # noqa: E402
 from utils.object import set_object_world_pose, spawn_object # noqa: E402
 from utils.poses import load_pose_trajectory                 # noqa: E402
 from utils.robot import setup_robot                          # noqa: E402
@@ -66,14 +98,12 @@ from utils.rotation import detect_quaternion_order           # noqa: E402
 from utils.scene import build_scene                          # noqa: E402
 
 
-def _ensure_wxyz(arm_xyz_quat: np.ndarray) -> np.ndarray:
-    """Reorder quaternion columns to wxyz if the H5 stores xyzw."""
-    order = detect_quaternion_order(arm_xyz_quat[:, 3:])
-    if order == "xyzw":
-        out = arm_xyz_quat.copy()
-        out[:, 3:] = arm_xyz_quat[:, [6, 3, 4, 5]]
-        return out
-    return arm_xyz_quat
+# capture.py's setup_recording expects record_overlay as a comma-separated
+# string; argparse gives us a list of floats. Translate.
+args.record_overlay = (
+    ",".join(f"{a:.4f}" for a in args.record_overlay)
+    if args.record_overlay else None
+)
 
 
 # ── Build scene + robot ──────────────────────────────────────────────────────
@@ -83,19 +113,35 @@ stage = build_scene(cfg, robot_collision=False)
 world = World()
 robot = setup_robot(world, cfg)
 
-# ── Optional camera ──────────────────────────────────────────────────────────
+# ── Camera (auto-load H5 extrinsic unless opted out) ─────────────────────────
 if not args.no_camera:
     try:
         from utils.camera import setup_camera
-        setup_camera(stage, cfg.camera)
+        world_pose_override = None
+        if args.use_h5_extrinsic:
+            try:
+                world_pose_override = read_h5_extrinsic(
+                    args.h5, camera=args.h5_camera,
+                    mount_xyz=cfg.robot.mount_xyz,
+                    mount_rpy=cfg.robot.mount_rpy,
+                )
+                print(f"[kinematic_replay] Using H5-stored extrinsic from "
+                      f"{args.h5.name} (camera={args.h5_camera}) — DIAGNOSTIC")
+            except KeyError:
+                print(f"[kinematic_replay] --use-h5-extrinsic requested but "
+                      f"H5 lacks one; falling back to calibrated .npz")
+        # world_pose_override stays None when not --use-h5-extrinsic, so
+        # setup_camera() loads cfg.camera.extrinsic_path (the calibrated
+        # AprilTag-PnP .npz) — the canonical source of truth.
+        setup_camera(stage, cfg.camera, world_pose_override=world_pose_override)
     except (ValueError, FileNotFoundError) as e:
         print(f"[kinematic_replay] Skipping camera setup: {e}")
 
 # ── Load H5 trajectory ───────────────────────────────────────────────────────
-with H5Reader(args.h5, camera=args.camera_name) as h5:
+with H5Reader(args.h5, camera=args.h5_camera) as h5:
     traj = h5.load_trajectories()
 
-    arm_xyz_quat = _ensure_wxyz(traj["arm_xyz_quat"])
+    arm_xyz_quat = detect_quaternion_order(traj["arm_xyz_quat"], "arm")
     hand_q       = traj["hand_q"]
     n_frames     = traj["n_frames"]
 
@@ -117,10 +163,11 @@ with H5Reader(args.h5, camera=args.camera_name) as h5:
                       f"{object_traj.shape[0]} frames; H5 has {n_frames}. "
                       f"Replay uses min(N, n_frames).")
 
-    if args.record_sim or args.record_sidebyside or args.record_overlay:
-        print("[kinematic_replay] Recording flags supplied; the capture "
-              "pipeline is a Phase 7 follow-up (it depends on the new H5 "
-              "schema for sidebyside/overlay frames). Skipping for now.")
+    # ── Recording setup ────────────────────────────────────────────────────
+    video_suffix = "qpos" + (f"_{args.object}" if args.object else "")
+    recorder, _, sbs_recorder, _, overlay_recorders = setup_recording(
+        args, args.h5, n_frames, video_suffix, APP_W, APP_H,
+    )
 
     # ── Main replay loop ───────────────────────────────────────────────────
     print(f"[kinematic_replay] Replaying {n_frames} frames from {args.h5.name}")
@@ -130,8 +177,26 @@ with H5Reader(args.h5, camera=args.camera_name) as h5:
         if object_prim_path is not None and object_traj is not None:
             set_object_world_pose(stage, object_prim_path, object_traj[i])
         world.step(render=True)
+
+        if recorder is not None:
+            ok = capture_frame_to_writer(recorder, simulation_app)
+            if ok:
+                sim_frame = recorder["last_frame"]
+                if sbs_recorder is not None:
+                    capture_sidebyside_frame(sbs_recorder, sim_frame, i)
+                for ov in overlay_recorders:
+                    capture_overlay_frame(ov, sim_frame, i)
+
         if not simulation_app.is_running():
             break
+
+    # ── Close recorders (encode deferred frames + close H5 handles) ────────
+    if recorder is not None:
+        close_recorder(recorder)
+    if sbs_recorder is not None:
+        close_sidebyside(sbs_recorder)
+    for ov in overlay_recorders:
+        close_overlay(ov)
 
     fail_count = robot["set_positions"].get_ik_failure_count()
     if fail_count:

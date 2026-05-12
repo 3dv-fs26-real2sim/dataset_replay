@@ -136,7 +136,11 @@ def _add_tables(stage: Usd.Stage, cfg: SceneConfig) -> None:
 
 
 def _add_walls(stage: Usd.Stage, cfg: SceneConfig) -> tuple[str, ...]:
-    """Three walls forming a U around the workspace, opening toward +X.
+    """Three walls forming a U around the workspace, opening toward -X.
+
+    The back wall sits at the +X edge — i.e., in front of the robot's
+    panda_link0 (which faces +X by default). The camera lives on the
+    open -X side, looking +X over the workspace into the back wall.
 
     Returns the prim paths of the three walls so that the collision filter
     can target them.
@@ -155,7 +159,7 @@ def _add_walls(stage: Usd.Stage, cfg: SceneConfig) -> tuple[str, ...]:
 
     walls = (
         # name           size_xyz                   centre_xyz                                  height
-        ("Back",  (th, Ly + 2 * th, h_back),  (x_min - th / 2, cfg.table.centre_xy[1], z_top + h_back / 2)),
+        ("Back",  (th, Ly + 2 * th, h_back),  (x_max + th / 2, cfg.table.centre_xy[1], z_top + h_back / 2)),
         ("Left",  (Lx, th, h_left),           (cfg.table.centre_xy[0], y_max + th / 2, z_top + h_left / 2)),
         ("Right", (Lx, th, h_right),          (cfg.table.centre_xy[0], y_min - th / 2, z_top + h_right / 2)),
     )

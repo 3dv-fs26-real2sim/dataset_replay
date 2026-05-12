@@ -4,7 +4,8 @@ No Isaac Sim or GPU required — pure H5 read + imageio encode.
 
 Usage:
     python dataset_replay/scripts/record_h5.py --h5 path/to/file.h5
-    python dataset_replay/scripts/record_h5.py --h5 file.h5 --camera oakd_front_view --fps 30
+    # If you have an older 50 Hz dataset (e.g. `*_50hz`), override:
+    python dataset_replay/scripts/record_h5.py --h5 old.h5 --fps 50
 """
 
 import argparse
@@ -15,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.config import PROJECT_ROOT  # type: ignore[import-not-found]
+from utils.constants import H5_DEFAULT_FPS
 from utils.h5_loader import H5Reader
 
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
@@ -26,8 +28,9 @@ def main() -> int:
                         help="Path to the H5 file")
     parser.add_argument("--camera", type=str, default=H5Reader.DEFAULT_CAMERA,
                         help=f"Camera name in H5 (default: {H5Reader.DEFAULT_CAMERA})")
-    parser.add_argument("--fps", type=float, default=50.0,
-                        help="Output video frame rate (default: 50.0)")
+    parser.add_argument("--fps", type=float, default=H5_DEFAULT_FPS,
+                        help=f"Output video frame rate (default: {H5_DEFAULT_FPS}, "
+                             f"matching H5_DEFAULT_FPS in utils/constants.py)")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output MP4 path (default: outputs/<stem>_<camera>.mp4)")
     args = parser.parse_args()

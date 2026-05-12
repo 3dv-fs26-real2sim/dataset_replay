@@ -1,0 +1,11 @@
+{
+  "comment": "OAK-D Pro AF spec-sheet derived intrinsics at 480x270. Assumptions: IMX378 sensor, 1.55 um pixel pitch, 4.81 mm focal length, native 4056x3040 (square pixels). fx_native = 4.81e-3 / 1.55e-6 = 3103.23 px. Scaled to 480 wide assuming a center-aligned 480x270 viewport carved from the native 4:3 area (480/4056 = 0.118343): fx ~ 367.16. cx, cy are image center. Zero distortion is the spec-sheet default; the device's factory calibration carries small radial coefficients that aren't reflected here. Compare against the H5-stored K to gauge real-camera divergence from spec.",
+  "fx": 367.16,
+  "fy": 367.16,
+  "cx": 240.0,
+  "cy": 135.0,
+  "distortion": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "width": 480,
+  "height": 270,
+  "source": "OAK-D Pro AF spec sheet (IMX378, 4.81 mm lens)"
+}
