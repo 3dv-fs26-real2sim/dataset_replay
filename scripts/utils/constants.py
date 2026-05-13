@@ -84,3 +84,17 @@ WRIST_HOME_ROTATION = np.array([
 # The URDF panda_link7/8 frame has Rx(180°) when the hand points down.
 # Pre-multiply by Rx(180°) (in wxyz: [0, 1, 0, 0]) to convert tool→URDF.
 Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])
+
+# Which components of the H5 quaternion to negate BEFORE the Rx(180°)
+# premultiplication. Used to test rotation-convention hypotheses (Hamilton
+# vs JPL, active vs passive, frame chirality). One of:
+#
+#   "baseline"  no negation                   [w,  x,  y,  z]
+#   "negx"      negate x                      [w, -x,  y,  z]
+#   "negy"      negate y                      [w,  x, -y,  z]
+#   "negz"      negate z                      [w,  x,  y, -z]
+#   "negxy"     negate x, y    (= conj Rz)    [w, -x, -y,  z]
+#   "negxz"     negate x, z    (= conj Ry)    [w, -x,  y, -z]
+#   "negyz"     negate y, z    (= conj Rx)    [w,  x, -y, -z]
+#   "conjugate" negate x, y, z (= inverse)    [w, -x, -y, -z]
+TOOL_QUAT_NEGATE_PATTERN: str = "baseline"
