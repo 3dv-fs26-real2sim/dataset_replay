@@ -78,6 +78,8 @@ WRIST_HOME_ROTATION = np.array([
     [0,  0, -1],
 ], dtype=float)
 
+#! Quaternion axis in the H5 file is there a space for discrepency there? 
+
 # H5 data uses a tool-frame convention where identity = hand pointing down.
 # The URDF panda_link7/8 frame has Rx(180°) when the hand points down.
 # Pre-multiply by Rx(180°) (in wxyz: [0, 1, 0, 0]) to convert tool→URDF.

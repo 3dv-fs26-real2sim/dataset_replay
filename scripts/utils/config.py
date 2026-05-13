@@ -185,10 +185,10 @@ class RobotMountConfig:
     Defaults place ``panda_link0`` at:
 
       * laterally: centre of the RIGHT table (Y = -table.single_size_xy[1] / 2)
-      * axially:   10 cm forward (+X) of the back edge (X = x_min + 0.10)
+      * axially:   24.5cm from the back edge to the link0 origin
       * vertically: on the table top (Z = top_z)
 
-    yielding ``(-0.40, -0.35, 0.75)`` with the default table.
+    yielding ``(-0.255, -0.35, 0.75)`` with the default table.
 
     NOTE: ``panda_link0`` has a non-trivial local translate inside the USD
     ``(-0.00761, -0.00027, -0.47602)``. The wrapper transform must subtract
@@ -196,15 +196,7 @@ class RobotMountConfig:
     and the USD-internal offset are exposed here so the math is fully
     inspectable.
     """
-    # Corrected from (-0.40, -0.35, 0.75) by +0.154 m in X: the previous
-    # value treated mount_xyz as the back-of-link0 reference, but
-    # ``utils.scene._add_robot`` actually places the kinematic
-    # panda_link0 origin at this point. The back of the link0 mesh
-    # extends 0.154 m in -X from the origin (measured from
-    # pandaorca_description/meshes/franka/fer/visual/link0.dae); the
-    # corrected value puts the back of the physical robot puck at the
-    # previously-measured -0.40 m reference.
-    mount_xyz: tuple[float, float, float] = (-0.246, -0.35, 0.75)
+    mount_xyz: tuple[float, float, float] = (-0.255, -0.35, 0.75)
     mount_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
     panda_link0_local_translate: tuple[float, float, float] = (
         -0.007610592991113663,
