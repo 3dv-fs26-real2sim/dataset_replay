@@ -64,10 +64,16 @@ HAND_HOME_JOINT_VALUES = np.zeros(N_HAND_DOFS)
 # ── IK configuration ──────────────────────────────────────────────────────────
 EE_FRAME_NAME = "panda_link8"
 
-# The EE wrist (as recorded in H5 data) is offset from panda_link8 in
-# panda_link8's local frame. To position the EE wrist at a target, the IK
-# must aim panda_link8 at: target_pos - R_link8 @ EE_WRIST_OFFSET_IN_LINK8.
-# Values provided by supervisors from the OrcaHand Wiki.
+# Offset from panda_link8 to the recorded "EE wrist" reference point, in
+# panda_link8's local frame. IK aims panda_link8 at
+# ``target_pos - R_link8 @ EE_WRIST_OFFSET_IN_LINK8``.
+#
+# Value [0.13, 0, 0.07] is the *teleop EE-wrist* convention shared with
+# franka_teleop and the IsaacLab env cfg (teleop_manip_env_cfg.py:61).
+# It sits ~3 cm forward of the URDF ``right_palm`` link, which composes
+# from the link8→...→right_palm chain to [0.098, -0.003, 0.067]. The two
+# differ because they reference different points on the hand; the teleop
+# value is what the H5 was recorded against, so we use it here.
 EE_WRIST_OFFSET_IN_LINK8 = np.array([0.13, 0.0, 0.07])
 
 # Home wrist target pose for IK.
@@ -78,23 +84,34 @@ WRIST_HOME_ROTATION = np.array([
     [0,  0, -1],
 ], dtype=float)
 
-#! Quaternion axis in the H5 file is there a space for discrepency there? 
+# ── H5 → URDF quaternion frame change ────────────────────────────────────────
+# The H5 records wrist quaternions in Rokoko's left-handed sensor frame
+# (their X-axis aligns with our URDF Z-axis). Three independent conventions
+# differ between recording and replay; we fix all three in tool_quat_to_urdf:
+#
+#   1. Handedness   (LH → RH)        — negate x, z components
+#   2. Axis labels  (their X ↔ our Z) — swap x, z components
+#   3. Tool identity (down → URDF)   — pre-multiply Rx(180°)
+#
+# The three operations are orthogonal: handedness only fixes chirality, the
+# axis swap only relabels, and Rx(180°) only flips "identity = hand-down"
+# (recording) into "identity = Franka flange default" (URDF). Removing any
+# one of them breaks the others; in particular, replacing Rx(180°) with
+# Rz(180°) to "mirror" the teleop's rokoko_ingress.py:191 rotation is wrong
+# — that Rz(180°) is upstream of the H5 and is already baked in.
+Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])  # Rx(180°) — tool-identity flip
 
-# H5 data uses a tool-frame convention where identity = hand pointing down.
-# The URDF panda_link7/8 frame has Rx(180°) when the hand points down.
-# Pre-multiply by Rx(180°) (in wxyz: [0, 1, 0, 0]) to convert tool→URDF.
-Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])
-
-# Which components of the H5 quaternion to negate BEFORE the Rx(180°)
-# premultiplication. Used to test rotation-convention hypotheses (Hamilton
-# vs JPL, active vs passive, frame chirality). One of:
+# Which components of the H5 quaternion to negate BEFORE the axis swap +
+# Rx(180°) premultiplication. The operational value is "negxz" — the
+# handedness flip for Rokoko-LH → URDF-RH. Other values are diagnostic
+# knobs for sign-ambiguity testing (Hamilton vs JPL, active vs passive).
 #
 #   "baseline"  no negation                   [w,  x,  y,  z]
 #   "negx"      negate x                      [w, -x,  y,  z]
 #   "negy"      negate y                      [w,  x, -y,  z]
 #   "negz"      negate z                      [w,  x,  y, -z]
 #   "negxy"     negate x, y    (= conj Rz)    [w, -x, -y,  z]
-#   "negxz"     negate x, z    (= conj Ry)    [w, -x,  y, -z]
+#   "negxz"     negate x, z    (= conj Ry)    [w, -x,  y, -z]   ← operational
 #   "negyz"     negate y, z    (= conj Rx)    [w,  x, -y, -z]
 #   "conjugate" negate x, y, z (= inverse)    [w, -x, -y, -z]
-TOOL_QUAT_NEGATE_PATTERN: str = "baseline"
+TOOL_QUAT_NEGATE_PATTERN: str = "negxz"
