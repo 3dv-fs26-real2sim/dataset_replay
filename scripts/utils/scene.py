@@ -1,8 +1,9 @@
-"""Programmatic scene construction (single-arm, OAK-D, procedural).
+"""Programmatic scene construction (single-arm, Aria, procedural — egoverse).
 
 Builds the simulation stage from scratch: Z-up, metric, with a ground plane,
-two side-by-side tables, three U-shape walls, an AprilTag plane on the table
-top, and the right-arm Panda + OrcaHand referenced from the orcav1b USD.
+two side-by-side tables, and the right-arm Panda + OrcaHand referenced from
+the orcav1b USD. No walls, no AprilTag — the egoverse capture is an open
+desk in front of an Aria wearer.
 
 Depends on ``pxr`` and ``omni.usd`` — must be imported after
 ``SimulationApp`` is created.
@@ -16,7 +17,6 @@ import numpy as np
 import omni.usd
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
-from .apriltag import add_apriltag_plane
 from .config import SceneConfig
 from .constants import ROBOT_PRIM_PATH
 from .textures import bind_image_texture, define_box_mesh, set_box_planar_uvs
@@ -27,10 +27,10 @@ def build_scene(cfg: SceneConfig, *, robot_collision: bool = False) -> Usd.Stage
     """Create a fresh stage and populate it from ``cfg``.
 
     With ``robot_collision=False`` (the default for kinematic replay), the
-    robot's self-collisions and its filtered pairs against table/walls/ground
-    are disabled. PhysX therefore tracks the teleported joint positions
-    without integrating contact forces — the robot does not jitter when the
-    replayed pose intersects scene geometry.
+    robot's self-collisions and its filtered pairs against table/ground are
+    disabled. PhysX therefore tracks the teleported joint positions without
+    integrating contact forces — the robot does not jitter when the replayed
+    pose intersects scene geometry.
 
     Returns the active ``Usd.Stage``.
     """
@@ -44,12 +44,10 @@ def build_scene(cfg: SceneConfig, *, robot_collision: bool = False) -> Usd.Stage
     _add_ground_plane(stage)
     _add_lighting(stage)
     _add_tables(stage, cfg)
-    wall_paths = _add_walls(stage, cfg)
-    add_apriltag_plane(stage, cfg)
     _add_robot(stage, cfg)
 
     if not robot_collision:
-        _disable_robot_collisions(stage, wall_paths)
+        _disable_robot_collisions(stage)
 
     return stage
 
@@ -135,53 +133,6 @@ def _add_tables(stage: Usd.Stage, cfg: SceneConfig) -> None:
         col.CreateApproximationAttr("convexHull")
 
 
-def _add_walls(stage: Usd.Stage, cfg: SceneConfig) -> tuple[str, ...]:
-    """Three walls forming a U around the workspace, opening toward -X.
-
-    The back wall sits at the +X edge — i.e., in front of the robot's
-    panda_link0 (which faces +X by default). The camera lives on the
-    open -X side, looking +X over the workspace into the back wall.
-
-    Returns the prim paths of the three walls so that the collision filter
-    can target them.
-    """
-    UsdGeom.Xform.Define(stage, "/World/Walls")
-
-    Lx, Ly = cfg.table.combined_size_xy
-    th     = cfg.walls.thickness
-    z_top  = cfg.table.top_z
-    h_back, h_left, h_right = (cfg.walls.back_height,
-                               cfg.walls.left_height,
-                               cfg.walls.right_height)
-
-    x_min, x_max = cfg.table.x_extent
-    y_min, y_max = cfg.table.y_extent
-
-    walls = (
-        # name           size_xyz                   centre_xyz                                  height
-        ("Back",  (th, Ly + 2 * th, h_back),  (x_max + th / 2, cfg.table.centre_xy[1], z_top + h_back / 2)),
-        ("Left",  (Lx, th, h_left),           (cfg.table.centre_xy[0], y_max + th / 2, z_top + h_left / 2)),
-        ("Right", (Lx, th, h_right),          (cfg.table.centre_xy[0], y_min - th / 2, z_top + h_right / 2)),
-    )
-
-    paths: list[str] = []
-    for name, size, centre in walls:
-        prim_path = f"/World/Walls/{name}"
-        mesh = define_box_mesh(stage, prim_path, size_xyz=size, centre_xyz=centre,
-                               display_color=(0.45, 0.32, 0.20))
-        set_box_planar_uvs(mesh, extent_xyz=size, uv_repeat=cfg.walls.uv_repeat)
-        if cfg.walls.texture_path.exists():
-            bind_image_texture(stage, prim_path, cfg.walls.texture_path,
-                               material_name="wood_wall_mat")
-        # Walls are static — give them a collision API so dropped objects
-        # respect them, but skip the heavy MeshCollisionAPI pipeline.
-        UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
-        col = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
-        col.CreateApproximationAttr("boundingCube")
-        paths.append(prim_path)
-    return tuple(paths)
-
-
 def _add_robot(stage: Usd.Stage, cfg: SceneConfig) -> None:
     """Reference the orcav1b USD as ``/World/Robot`` with the wrapper transform
     that places ``panda_link0`` at ``cfg.robot.mount_xyz``.
@@ -216,11 +167,9 @@ def _add_robot(stage: Usd.Stage, cfg: SceneConfig) -> None:
         _override_translate(prim, wrapper_translate)
 
 
-def _disable_robot_collisions(
-    stage: Usd.Stage, wall_paths: tuple[str, ...]
-) -> None:
+def _disable_robot_collisions(stage: Usd.Stage) -> None:
     """Disable PhysX self-collisions on the articulation and filter against
-    static scene geometry. Standard kinematic-replay setup.
+    static scene geometry (tables + ground). Standard kinematic-replay setup.
 
     Walking ``Usd.PrimRange`` and clearing ``CollisionAPI`` doesn't work
     against the orcav1b USD's instanceable Xforms; the two knobs that DO
@@ -229,8 +178,8 @@ def _disable_robot_collisions(
     1. ``physxArticulation:enabledSelfCollisions = False`` on the articulation
        root (the wrapper Xform that holds the reference) — kills
        finger-vs-finger and link-vs-link contacts.
-    2. ``UsdPhysics.FilteredPairsAPI`` on the articulation root, targeting the
-       table cells, walls, and ground plane.
+    2. ``UsdPhysics.FilteredPairsAPI`` on the articulation root, targeting
+       the table cells and the ground plane.
     """
     prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
     prim.CreateAttribute(
@@ -240,8 +189,7 @@ def _disable_robot_collisions(
 
     pair_api = UsdPhysics.FilteredPairsAPI.Apply(prim)
     rel = pair_api.CreateFilteredPairsRel()
-    for target in (*wall_paths, "/World/GroundPlane"):
-        rel.AddTarget(Sdf.Path(target))
+    rel.AddTarget(Sdf.Path("/World/GroundPlane"))
     # Filter against every table cell.
     tables_root = stage.GetPrimAtPath("/World/Tables")
     if tables_root.IsValid():

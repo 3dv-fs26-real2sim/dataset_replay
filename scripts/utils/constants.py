@@ -1,8 +1,15 @@
-"""Robot kinematic constants (slim, single-arm).
+"""Robot kinematic constants (slim, single-arm, Aria camera).
 
 These values are intrinsic to the robot model — joint names, home pose, the
 EE-wrist offset, the H5 tool-frame quaternion convention. Scene parameters
-(table, walls, AprilTag, camera, mount pose) live in :mod:`config`.
+(table, camera mount pose) live in :mod:`config`.
+
+The Aria-camera constants (intrinsics + a robot-base-relative extrinsic)
+also live here because they describe the *physical* recording rig rather
+than anything procedural the scene builder picks: the Aria sat in a fixed
+place on the wearer's head during the egoverse recordings, so its pose
+relative to the right-arm base is the same across sessions until a new
+calibration changes it.
 
 No Isaac Sim imports — safe to import before SimulationApp is created.
 """
@@ -102,16 +109,68 @@ WRIST_HOME_ROTATION = np.array([
 Q_TOOL_TO_URDF = np.array([0.0, 1.0, 0.0, 0.0])  # Rx(180°) — tool-identity flip
 
 # Which components of the H5 quaternion to negate BEFORE the axis swap +
-# Rx(180°) premultiplication. The operational value is "negxz" — the
-# handedness flip for Rokoko-LH → URDF-RH. Other values are diagnostic
-# knobs for sign-ambiguity testing (Hamilton vs JPL, active vs passive).
+# Rx(180°) premultiplication. Egoverse uses the same Rokoko-based recording
+# path as maple, so the operational value is ``"negxz"`` — the handedness
+# flip for Rokoko-LH → URDF-RH. Other values are diagnostic knobs for
+# sign-ambiguity testing (Hamilton vs JPL, active vs passive).
 #
 #   "baseline"  no negation                   [w,  x,  y,  z]
 #   "negx"      negate x                      [w, -x,  y,  z]
 #   "negy"      negate y                      [w,  x, -y,  z]
 #   "negz"      negate z                      [w,  x,  y, -z]
 #   "negxy"     negate x, y    (= conj Rz)    [w, -x, -y,  z]
-#   "negxz"     negate x, z    (= conj Ry)    [w, -x,  y, -z]   ← operational
+#   "negxz"     negate x, z    (= conj Ry)    [w, -x,  y, -z]   ← operational (egoverse / maple)
 #   "negyz"     negate y, z    (= conj Rx)    [w,  x, -y, -z]
 #   "conjugate" negate x, y, z (= inverse)    [w, -x, -y, -z]
 TOOL_QUAT_NEGATE_PATTERN: str = "negxz"
+
+
+# ── Aria camera intrinsics + extrinsic ────────────────────────────────────────
+# These values were measured for the original main-branch capture rig and
+# are reused verbatim for egoverse, which shares the same Aria glasses and
+# recording pose. The 4×4 ``ARIA_EXTRINSICS_RIGHT`` is the camera-in-base
+# transform — i.e., ``T_world_cam = T_world_base @ ARIA_EXTRINSICS_RIGHT``
+# where ``T_world_base`` is the world pose of ``panda_link0``. Because the
+# physical robot sits in the same place relative to the wearer in egoverse
+# as in main, the base-relative camera transform carries over without
+# re-measurement; only the absolute table-top Z differs (egoverse uses
+# 0.75 m vs main's 1.0 m), which the world composition absorbs.
+ARIA_INTRINSICS = {
+    "width":  640,
+    "height": 480,
+    "fx": 266.50860444,   # = 133.25430222 × 2 (factory half-res × 2)
+    "fy": 266.50860444,
+    "cx": 320.0,
+    "cy": 240.0,
+}
+
+ARIA_EXTRINSICS_RIGHT = np.array([
+    [ 0.02933941, -0.83227828,  0.55358113,  0.17515134],
+    [-0.99642232,  0.01956109,  0.0822187 ,  0.34649483],
+    [-0.07925749, -0.55401284, -0.82872675,  0.46895363],
+    [ 0.        ,  0.        ,  0.        ,  1.        ],
+])
+
+
+# ── Table-edge geometry for desk-based extrinsic refinement ───────────────────
+# The refiner (scripts/calibrate_extrinsic_table.py) aligns 3D table edges
+# projected through the current camera to 2D SAM-mask lines extracted from
+# the recorded video. The three line segments below must match the
+# parametric ``TableConfig`` defaults (1.0 × 1.4 m centred at origin, top
+# at z = 0.75). If you change ``TableConfig`` and want desk refinement to
+# stay valid, rebuild these from the config — but for the default scene
+# the hard-coded constants are correct and avoid pulling SceneConfig into
+# the refiner's pure-CV path.
+TABLE_TOP_Z  = 0.75
+TABLE_X_HALF = 0.5
+TABLE_Y_HALF = 0.7
+
+# Far (back) edge of the combined table (at +X), running along Y.
+TABLE_TOP_EDGE_WORLD  = np.array([[+TABLE_X_HALF, -TABLE_Y_HALF, TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z]])
+# Left edge (at +Y), running along X.
+TABLE_LEFT_EDGE_WORLD = np.array([[-TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, +TABLE_Y_HALF, TABLE_TOP_Z]])
+# Physical seam between the two table cells, running along X at y = 0.
+TABLE_SEAM_WORLD      = np.array([[-TABLE_X_HALF, 0.0,           TABLE_TOP_Z],
+                                  [+TABLE_X_HALF, 0.0,           TABLE_TOP_Z]])

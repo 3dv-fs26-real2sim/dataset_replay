@@ -1,1 +1,2 @@
-!oakd_extrinsic.npz
+*.npz
+!.gitkeep

@@ -1,4 +1,4 @@
-"""Single-arm kinematic replay against an H5 recording.
+"""Single-arm kinematic replay against an Aria-recorded H5 (egoverse).
 
 Loads a wrist+hand trajectory from H5, solves IK per frame, drives the
 articulation kinematically, and (optionally) replays a kinematic object
@@ -11,17 +11,11 @@ Usage::
     python scripts/kinematic_replay.py --h5 ... --record-sim
     python scripts/kinematic_replay.py --h5 ... --record-sidebyside --record-overlay 0.3 0.6
 
-By default the camera world pose is loaded from the calibrated extrinsic
-file at ``CameraConfig.extrinsic_path`` (typically the AprilTag-PnP output
-of ``scripts/calibrate_extrinsic.py``). Pass ``--use-h5-extrinsic`` to
-instead compose the H5-stored ``T_robot_cam`` with the configured
-``robot.mount_xyz`` — this matches the recording-time pose stored in the
-H5 and is mainly useful as a diagnostic; the saved ``.npz`` is the
-canonical source of truth (see ``utils.calibration`` and the project
-calibration source-of-truth note). When the H5 file lacks a stored
-extrinsic, ``--use-h5-extrinsic`` silently falls back to the same
-``.npz`` chain. Matches the convention used by ``test_setup.py`` and
-``visualize_calibration.py``.
+The Aria camera viewport pose is by default computed at runtime as
+``T_world_panda_link0 @ ARIA_EXTRINSICS_RIGHT`` (constants in
+``utils.constants``). Pass ``--refined-extrinsic PATH`` to override with a
+per-session refined ``T_world_cam`` produced by
+``scripts/calibrate_extrinsic_table.py``.
 """
 
 from __future__ import annotations
@@ -48,6 +42,10 @@ parser.add_argument("--h5", type=Path, required=True,
 parser.add_argument("--h5-camera", "--camera-name", dest="h5_camera",
                     type=str, default=H5Reader.DEFAULT_CAMERA,
                     help=f"Image dataset key in H5 (default: {H5Reader.DEFAULT_CAMERA})")
+parser.add_argument("--use-actions", action="store_true",
+                    help="Drive replay from top-level actions_arm / "
+                         "actions_hand instead of observations/qpos_arm / "
+                         "observations/qpos_hand.")
 parser.add_argument("--object", type=str, default=None,
                     help="Object name to spawn (folder under objects/)")
 parser.add_argument("--object-traj", type=Path, default=None,
@@ -55,13 +53,11 @@ parser.add_argument("--object-traj", type=Path, default=None,
 parser.add_argument("--object-scale", type=float, default=0.1,
                     help="Object scale (default: 0.1)")
 parser.add_argument("--no-camera", action="store_true",
-                    help="Skip OAK-D camera setup")
-parser.add_argument("--use-h5-extrinsic", action="store_true",
-                    help="Use the H5-stored T_robot_cam (composed with "
-                         "cfg.robot.mount_xyz) as T_world_cam, instead of "
-                         "the calibrated .npz at cfg.camera.extrinsic_path. "
-                         "Diagnostic only — see project notes on calibration "
-                         "source-of-truth.")
+                    help="Skip Aria camera setup")
+parser.add_argument("--refined-extrinsic", type=Path, default=None,
+                    help="Path to an NPZ produced by "
+                         "scripts/calibrate_extrinsic_table.py. When set, its "
+                         "'T_world_cam' overrides the nominal Aria pose.")
 
 # Recording flags. Capture wiring requires --no-camera off and a viewport.
 parser.add_argument("--record-sim", action="store_true",
@@ -90,7 +86,6 @@ from utils.capture import (                                  # noqa: E402
     close_sidebyside,
     setup_recording,
 )
-from utils.h5_loader import read_h5_extrinsic                # noqa: E402
 from utils.object import set_object_world_pose, spawn_object # noqa: E402
 from utils.poses import load_pose_trajectory                 # noqa: E402
 from utils.robot import setup_robot                          # noqa: E402
@@ -113,32 +108,31 @@ stage = build_scene(cfg, robot_collision=False)
 world = World()
 robot = setup_robot(world, cfg)
 
-# ── Camera (auto-load H5 extrinsic unless opted out) ─────────────────────────
+# ── Camera (Aria, optionally refined) ────────────────────────────────────────
 if not args.no_camera:
     try:
         from utils.camera import setup_camera
         world_pose_override = None
-        if args.use_h5_extrinsic:
-            try:
-                world_pose_override = read_h5_extrinsic(
-                    args.h5, camera=args.h5_camera,
-                    mount_xyz=cfg.robot.mount_xyz,
-                    mount_rpy=cfg.robot.mount_rpy,
-                )
-                print(f"[kinematic_replay] Using H5-stored extrinsic from "
-                      f"{args.h5.name} (camera={args.h5_camera}) — DIAGNOSTIC")
-            except KeyError:
-                print(f"[kinematic_replay] --use-h5-extrinsic requested but "
-                      f"H5 lacks one; falling back to calibrated .npz")
-        # world_pose_override stays None when not --use-h5-extrinsic, so
-        # setup_camera() loads cfg.camera.extrinsic_path (the calibrated
-        # AprilTag-PnP .npz) — the canonical source of truth.
+        if args.refined_extrinsic is not None:
+            with np.load(args.refined_extrinsic) as d:
+                if "T_world_cam" not in d.files:
+                    raise KeyError(f"{args.refined_extrinsic} missing 'T_world_cam'")
+                world_pose_override = np.asarray(d["T_world_cam"], dtype=float)
+                refined_camera = str(d["camera"]) if "camera" in d.files else "?"
+            if refined_camera not in ("?", cfg.camera.name):
+                print(f"[kinematic_replay] refined extrinsic camera "
+                      f"{refined_camera!r} != cfg.camera.name "
+                      f"{cfg.camera.name!r}; falling back to nominal")
+                world_pose_override = None
+            else:
+                print(f"[kinematic_replay] using refined extrinsic from "
+                      f"{args.refined_extrinsic.name}")
         setup_camera(stage, cfg.camera, world_pose_override=world_pose_override)
-    except (ValueError, FileNotFoundError) as e:
+    except (ValueError, FileNotFoundError, KeyError) as e:
         print(f"[kinematic_replay] Skipping camera setup: {e}")
 
 # ── Load H5 trajectory ───────────────────────────────────────────────────────
-with H5Reader(args.h5, camera=args.h5_camera) as h5:
+with H5Reader(args.h5, camera=args.h5_camera, use_actions=args.use_actions) as h5:
     traj = h5.load_trajectories()
 
     arm_xyz_quat = detect_quaternion_order(traj["arm_xyz_quat"], "arm")

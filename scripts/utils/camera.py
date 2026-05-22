@@ -1,8 +1,17 @@
-"""OAK-D Pro AF camera setup — single, world-fixed pinhole camera.
+"""Aria camera setup for the egoverse branch.
 
-The world pose is loaded from a saved extrinsic (output of
-``calibrate_extrinsic.py``), or computed from the nominal position+lookat+up
-in ``CameraConfig`` as a fallback.
+The world pose is computed at runtime as ``T_world_panda_link0 @ T_base_cam``
+where ``T_base_cam`` (= ``ARIA_EXTRINSICS_RIGHT``) is the wearer-rig
+calibration carried over from the original main-branch capture setup. The
+robot base sits in the same place relative to the wearer in egoverse as it
+did in main, so the base-relative transform is invariant; only the table-top
+Z differs (0.75 m here vs 1.0 m in main), and that's absorbed by the world
+composition.
+
+For per-session corrections, ``scripts/calibrate_extrinsic_table.py`` produces
+a refined ``T_world_cam`` NPZ by aligning projected table edges to SAM
+masks of the recorded video. Pass it through ``world_pose_override`` here
+to override the base-relative computation.
 
 Depends on ``pxr`` and ``omni.usd`` — must be imported after SimulationApp
 is created.
@@ -10,13 +19,11 @@ is created.
 
 from __future__ import annotations
 
-import warnings
-from pathlib import Path
-
 import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
 from .config import CameraConfig
+from .constants import ROBOT_BASE_PRIM_PATH
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
 # Diag(1, -1, -1, 1) flips Y and Z to convert between the two.
@@ -27,13 +34,12 @@ _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
                  *, prim_path: str | None = None,
                  world_pose_override: np.ndarray | None = None) -> str:
-    """Create a UsdGeom.Camera at the calibrated (or nominal) world pose and
-    set it as the active viewport camera. Returns the camera prim path.
+    """Create a UsdGeom.Camera at the Aria pose and set it as the active
+    viewport camera. Returns the camera prim path.
 
     If ``world_pose_override`` is supplied, it is used verbatim — bypassing
-    the saved-extrinsic file and the nominal lookat fallback. Useful for
-    plugging in a T_world_cam computed from an H5 dataset's stored
-    extrinsics (see ``utils.h5_loader.read_h5_extrinsic``).
+    the base-relative computation. Use this to plug in a refined
+    ``T_world_cam`` produced by ``scripts/calibrate_extrinsic_table.py``.
     """
     _check_intrinsics(cfg.intrinsics)
 
@@ -45,7 +51,7 @@ def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
             )
         print(f"[camera] {cfg.name}: using world_pose_override")
     else:
-        world_pose = _resolve_world_pose(cfg)
+        world_pose = compute_aria_world_pose(stage, cfg)
     pos = world_pose[:3, 3]
     print(f"[camera] {cfg.name}: world position [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 
@@ -54,6 +60,16 @@ def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
     create_camera_prim(stage, prim_path, world_pose, cfg)
     set_viewport_camera(prim_path)
     return prim_path
+
+
+def compute_aria_world_pose(stage: Usd.Stage, cfg: CameraConfig) -> np.ndarray:
+    """Return ``T_world_cam = T_world_panda_link0 @ cfg.t_base_cam()``.
+
+    Reads the right-arm base pose from the live USD stage so any shift of
+    ``RobotMountConfig.mount_xyz`` propagates without extra wiring.
+    """
+    T_world_base = get_prim_world_transform(stage, ROBOT_BASE_PRIM_PATH)
+    return T_world_base @ cfg.t_base_cam()
 
 
 def create_camera_prim(stage: Usd.Stage, prim_path: str,
@@ -118,66 +134,14 @@ def get_prim_world_transform(stage: Usd.Stage, prim_path: str) -> np.ndarray:
     return np.array(gf_mat, dtype=float).T
 
 
-# ── World-pose resolution ────────────────────────────────────────────────────
-def _resolve_world_pose(cfg: CameraConfig) -> np.ndarray:
-    """Prefer the saved calibration; fall back to the nominal lookat pose."""
-    path: Path = cfg.extrinsic_path
-    if path.exists():
-        T = np.load(path)["T_world_cam"]
-        print(f"[camera] Using calibrated extrinsic from {path}")
-        return T
-
-    warnings.warn(
-        f"No OAK-D extrinsic file at {path}. Using nominal pose; "
-        f"run scripts/calibrate_extrinsic.py to save a real one."
-    )
-    return lookat_to_T_world_cam(
-        cfg.nominal_position, cfg.nominal_lookat, cfg.nominal_up,
-    )
-
-
-def lookat_to_T_world_cam(
-    position: tuple[float, float, float] | np.ndarray,
-    lookat:   tuple[float, float, float] | np.ndarray,
-    up:       tuple[float, float, float] | np.ndarray,
-) -> np.ndarray:
-    """Build a 4x4 OpenCV-convention camera-in-world transform from the
-    (position, lookat, up) triple.
-
-    Camera axes (in world frame): +Z = forward (toward ``lookat``),
-    +X = right, +Y = down. With world-up = +Z, "down in image" is roughly
-    -world-up, so the y-axis is the down-cross-forward direction.
-    """
-    pos    = np.asarray(position, dtype=float)
-    lookat = np.asarray(lookat,   dtype=float)
-    up     = np.asarray(up,       dtype=float)
-
-    forward = lookat - pos
-    forward /= np.linalg.norm(forward)
-
-    right = np.cross(forward, up)
-    n = np.linalg.norm(right)
-    if n < 1e-9:
-        raise ValueError("nominal lookat direction is parallel to nominal up vector")
-    right /= n
-
-    down = np.cross(forward, right)
-
-    R = np.column_stack([right, down, forward])    # columns = camera axes in world
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3]  = pos
-    return T
-
-
 # ── Internal helpers ─────────────────────────────────────────────────────────
 def _check_intrinsics(K: dict) -> None:
     missing = [k for k in ("fx", "fy", "cx", "cy") if K.get(k, 0.0) == 0.0]
     if missing:
         raise ValueError(
-            f"OAK-D intrinsics keys {missing} are zero. Fill "
+            f"Aria intrinsics keys {missing} are zero. Fill "
             f"SceneConfig.camera.intrinsics from the factory calibration "
-            f"JSON before running."
+            f"before running."
         )
 
 

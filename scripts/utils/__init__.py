@@ -2,15 +2,13 @@
 
 Only re-exports that are safe before SimulationApp is created (no Isaac Sim
 deps). Isaac-Sim-using modules — robot, ik, capture, object, scene, camera,
-textures, apriltag — must be imported explicitly by entry scripts AFTER
-SimulationApp has been instantiated.
+textures — must be imported explicitly by entry scripts AFTER SimulationApp
+has been instantiated.
 """
 
 from .config import (
     SceneConfig,
     TableConfig,
-    WallsConfig,
-    AprilTagConfig,
     RobotMountConfig,
     CameraConfig,
 )
@@ -22,5 +20,7 @@ from .constants import (
     N_ARM_DOFS,
     N_ARM_POSE_DIMS,
     N_HAND_DOFS,
+    ARIA_INTRINSICS,
+    ARIA_EXTRINSICS_RIGHT,
 )
 from .h5_loader import H5Reader, peek_schema

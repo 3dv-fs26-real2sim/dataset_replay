@@ -1,19 +1,22 @@
-"""Visual smoke test for the procedural scene + robot setup.
+"""Visual smoke test for the egoverse procedural scene + robot setup.
 
-Loads ``SceneConfig`` defaults, builds the scene, sets the robot to the
-home pose via IK, and holds it. Useful for eyeballing table dimensions,
-wall heights, AprilTag placement, and robot mount pose against your
-physical setup.
+Loads ``SceneConfig`` defaults, builds the scene (tables only — no walls,
+no AprilTag), sets the robot to the home pose via IK, and holds it. Useful
+for eyeballing table dimensions, robot mount pose, and the Aria camera
+viewpoint against your physical setup.
 
 Usage:
-    python dataset_replay/scripts/test_setup.py
-    python dataset_replay/scripts/test_setup.py --headless --duration 5
+    python scripts/test_setup.py
+    python scripts/test_setup.py --headless --duration 5
+    python scripts/test_setup.py --refined-extrinsic data/sam_masks_aria_rgb_cam_extrinsic.npz
 """
 
 import argparse
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 
 # Allow running from project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,17 +32,15 @@ parser.add_argument("--duration", type=float, default=0.0,
                     help="Hold the home pose for N seconds before exiting "
                          "(0 = run until window closed; default 0)")
 parser.add_argument("--no-camera", action="store_true",
-                    help="Skip OAK-D camera setup (skip if intrinsics aren't filled in)")
+                    help="Skip Aria camera setup")
 parser.add_argument("--object", type=str, default=None,
                     help="Object name (folder under objects/) to spawn at a "
                          "fixed pose for visual sanity. Default: none — pass "
                          "e.g. `--object duck` to enable.")
-parser.add_argument("--from-h5", type=Path, default=None,
-                    help="Use this H5 file's stored extrinsic as T_world_cam "
-                         "(after composing with the configured mount_xyz). "
-                         "Bypasses the saved-extrinsic file + nominal fallback.")
-parser.add_argument("--camera-name", type=str, default=None,
-                    help="Camera key inside the H5 (default: cfg.camera.name).")
+parser.add_argument("--refined-extrinsic", type=Path, default=None,
+                    help="NPZ from scripts/calibrate_extrinsic_table.py with a "
+                         "refined T_world_cam to use instead of the nominal "
+                         "base-relative Aria pose.")
 args = parser.parse_args()
 
 # ── Boot Isaac Sim FIRST ─────────────────────────────────────────────────────
@@ -55,9 +56,9 @@ from utils.scene import build_scene  # noqa: E402
 
 # ── Build scene + robot ──────────────────────────────────────────────────────
 cfg = SceneConfig()
-print(f"[test_setup] mount xyz   = {cfg.robot.mount_xyz}")
-print(f"[test_setup] table dims  = {cfg.table.combined_size_xy} m, top z={cfg.table.top_z}")
-print(f"[test_setup] AprilTag XY = {cfg.apriltag_world_pose()[:3, 3]}")
+print(f"[test_setup] mount xyz  = {cfg.robot.mount_xyz}")
+print(f"[test_setup] table dims = {cfg.table.combined_size_xy} m, top z={cfg.table.top_z}")
+print(f"[test_setup] camera     = {cfg.camera.name} @ {cfg.camera.width}x{cfg.camera.height}")
 
 stage = build_scene(cfg, robot_collision=False)
 
@@ -71,16 +72,13 @@ if not args.no_camera:
     try:
         from utils.camera import setup_camera
         world_pose_override = None
-        if args.from_h5 is not None:
-            from utils.h5_loader import read_h5_extrinsic
-            cam_name = args.camera_name or cfg.camera.name
-            world_pose_override = read_h5_extrinsic(
-                args.from_h5, camera=cam_name,
-                mount_xyz=cfg.robot.mount_xyz,
-                mount_rpy=cfg.robot.mount_rpy,
-            )
-            print(f"[test_setup] Using H5 extrinsic from {args.from_h5.name} "
-                  f"(camera={cam_name})")
+        if args.refined_extrinsic is not None:
+            with np.load(args.refined_extrinsic) as d:
+                if "T_world_cam" not in d.files:
+                    raise KeyError(f"{args.refined_extrinsic} missing 'T_world_cam'")
+                world_pose_override = np.asarray(d["T_world_cam"], dtype=float)
+            print(f"[test_setup] Using refined extrinsic from "
+                  f"{args.refined_extrinsic.name}")
         setup_camera(stage, cfg.camera, world_pose_override=world_pose_override)
     except (ValueError, FileNotFoundError, KeyError) as e:
         print(f"[test_setup] Skipping camera setup: {e}")
