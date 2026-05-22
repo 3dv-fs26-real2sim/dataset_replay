@@ -8,7 +8,7 @@ viewpoint against your physical setup.
 Usage:
     python scripts/test_setup.py
     python scripts/test_setup.py --headless --duration 5
-    python scripts/test_setup.py --refined-extrinsic data/sam_masks_aria_rgb_cam_extrinsic.npz
+    python scripts/test_setup.py --sam-mask data/egoverse/desk/<stem>_desk.npz
 """
 
 import argparse
@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.app import add_common_args, create_app
 from utils.config import SceneConfig
+from utils.constants import ARIA_INTRINSICS
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description=__doc__,
@@ -37,14 +38,18 @@ parser.add_argument("--object", type=str, default=None,
                     help="Object name (folder under objects/) to spawn at a "
                          "fixed pose for visual sanity. Default: none — pass "
                          "e.g. `--object duck` to enable.")
-parser.add_argument("--refined-extrinsic", type=Path, default=None,
-                    help="NPZ from scripts/calibrate_extrinsic_table.py with a "
-                         "refined T_world_cam to use instead of the nominal "
-                         "base-relative Aria pose.")
+parser.add_argument("--sam-mask", type=Path, default=None,
+                    help="Optional SAM table-mask NPZ (key 'mask', shape "
+                         "(N, H, W)) for desk-based extrinsic refinement. "
+                         "If the file doesn't exist the test falls back to "
+                         "the nominal Aria pose with a warning.")
 args = parser.parse_args()
 
 # ── Boot Isaac Sim FIRST ─────────────────────────────────────────────────────
-simulation_app = create_app(args)
+# Render at the Aria K's 4:3 aspect; see the note in kinematic_replay.py.
+simulation_app = create_app(args,
+                            width=ARIA_INTRINSICS["width"]  * 2,
+                            height=ARIA_INTRINSICS["height"] * 2)
 
 # Now safe to import everything Isaac/pxr.
 from isaacsim.core.api import World  # noqa: E402
@@ -69,16 +74,31 @@ print(f"[test_setup] hand DOFs: {robot['hand_dof_indices']}")
 
 # ── Optional camera ──────────────────────────────────────────────────────────
 if not args.no_camera:
+    from utils.calibrate_table import (    # noqa: E402
+        compute_nominal_aria_pose,
+        refine_aria_extrinsic,
+    )
+    from utils.camera import setup_camera
+
+    world_pose_override = None
+    if args.sam_mask is not None:
+        if args.sam_mask.exists():
+            try:
+                result = refine_aria_extrinsic(args.sam_mask, cfg)
+                world_pose_override = result["T_world_cam"]
+                print(f"[test_setup] refined Aria pose from "
+                      f"{args.sam_mask.name}: Δrot="
+                      f"{result['delta_rot_deg']:.2f}°, "
+                      f"rms={result['residual_rms_px']:.3f}px")
+            except (KeyError, ValueError, RuntimeError) as e:
+                print(f"[test_setup] WARN: SAM refinement failed ({e}); "
+                      f"using nominal Aria pose")
+        else:
+            print(f"[test_setup] WARN: --sam-mask {args.sam_mask} does not "
+                  f"exist; using nominal Aria pose")
+    if world_pose_override is None:
+        world_pose_override = compute_nominal_aria_pose(cfg)
     try:
-        from utils.camera import setup_camera
-        world_pose_override = None
-        if args.refined_extrinsic is not None:
-            with np.load(args.refined_extrinsic) as d:
-                if "T_world_cam" not in d.files:
-                    raise KeyError(f"{args.refined_extrinsic} missing 'T_world_cam'")
-                world_pose_override = np.asarray(d["T_world_cam"], dtype=float)
-            print(f"[test_setup] Using refined extrinsic from "
-                  f"{args.refined_extrinsic.name}")
         setup_camera(stage, cfg.camera, world_pose_override=world_pose_override)
     except (ValueError, FileNotFoundError, KeyError) as e:
         print(f"[test_setup] Skipping camera setup: {e}")

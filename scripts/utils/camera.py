@@ -1,17 +1,12 @@
-"""Aria camera setup for the egoverse branch.
+"""USD camera placement (Isaac Sim side of the Aria-camera stack).
 
-The world pose is computed at runtime as ``T_world_panda_link0 @ T_base_cam``
-where ``T_base_cam`` (= ``ARIA_EXTRINSICS_RIGHT``) is the wearer-rig
-calibration carried over from the original main-branch capture setup. The
-robot base sits in the same place relative to the wearer in egoverse as it
-did in main, so the base-relative transform is invariant; only the table-top
-Z differs (0.75 m here vs 1.0 m in main), and that's absorbed by the world
-composition.
-
-For per-session corrections, ``scripts/calibrate_extrinsic_table.py`` produces
-a refined ``T_world_cam`` NPZ by aligning projected table edges to SAM
-masks of the recorded video. Pass it through ``world_pose_override`` here
-to override the base-relative computation.
+This module is intentionally narrow: it takes a 4×4 ``T_world_cam`` (computed
+by the caller — typically :mod:`utils.calibrate_table`) and configures a
+``UsdGeom.Camera`` prim with pinhole intrinsics from ``CameraConfig``. The
+caller decides whether that pose is the nominal base-relative one or a
+SAM-refined one; this module doesn't read the stage to derive it, keeping
+the pose used here in lock-step with the pose downstream consumers
+(object-trajectory composition, diagnostics) see.
 
 Depends on ``pxr`` and ``omni.usd`` — must be imported after SimulationApp
 is created.
@@ -23,7 +18,6 @@ import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
 from .config import CameraConfig
-from .constants import ROBOT_BASE_PRIM_PATH
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
 # Diag(1, -1, -1, 1) flips Y and Z to convert between the two.
@@ -33,43 +27,33 @@ _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 # ── Public API ───────────────────────────────────────────────────────────────
 def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
                  *, prim_path: str | None = None,
-                 world_pose_override: np.ndarray | None = None) -> str:
-    """Create a UsdGeom.Camera at the Aria pose and set it as the active
-    viewport camera. Returns the camera prim path.
+                 world_pose_override: np.ndarray) -> str:
+    """Create a UsdGeom.Camera at ``world_pose_override`` and make it the
+    active viewport camera. Returns the camera prim path.
 
-    If ``world_pose_override`` is supplied, it is used verbatim — bypassing
-    the base-relative computation. Use this to plug in a refined
-    ``T_world_cam`` produced by ``scripts/calibrate_extrinsic_table.py``.
+    The caller computes the pose — either via
+    :func:`utils.calibrate_table.compute_nominal_aria_pose` (cheap, pure
+    math) or :func:`utils.calibrate_table.refine_aria_extrinsic` (SAM-
+    based refinement). This module deliberately doesn't reach into the
+    stage to derive it, so the camera doesn't get out of sync with what
+    other code (object trajectory composition, diagnostics) sees.
     """
     _check_intrinsics(cfg.intrinsics)
 
-    if world_pose_override is not None:
-        world_pose = np.asarray(world_pose_override, dtype=float)
-        if world_pose.shape != (4, 4):
-            raise ValueError(
-                f"world_pose_override must be 4×4, got {world_pose.shape}"
-            )
-        print(f"[camera] {cfg.name}: using world_pose_override")
-    else:
-        world_pose = compute_aria_world_pose(stage, cfg)
+    world_pose = np.asarray(world_pose_override, dtype=float)
+    if world_pose.shape != (4, 4):
+        raise ValueError(
+            f"world_pose_override must be 4×4, got {world_pose.shape}"
+        )
     pos = world_pose[:3, 3]
-    print(f"[camera] {cfg.name}: world position [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
+    print(f"[camera] {cfg.name}: world position "
+          f"[{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 
     prim_path = prim_path or f"/World/Cameras/{_camel(cfg.name)}"
     UsdGeom.Xform.Define(stage, "/World/Cameras")
     create_camera_prim(stage, prim_path, world_pose, cfg)
     set_viewport_camera(prim_path)
     return prim_path
-
-
-def compute_aria_world_pose(stage: Usd.Stage, cfg: CameraConfig) -> np.ndarray:
-    """Return ``T_world_cam = T_world_panda_link0 @ cfg.t_base_cam()``.
-
-    Reads the right-arm base pose from the live USD stage so any shift of
-    ``RobotMountConfig.mount_xyz`` propagates without extra wiring.
-    """
-    T_world_base = get_prim_world_transform(stage, ROBOT_BASE_PRIM_PATH)
-    return T_world_base @ cfg.t_base_cam()
 
 
 def create_camera_prim(stage: Usd.Stage, prim_path: str,
@@ -122,16 +106,6 @@ def set_viewport_camera(camera_path: str) -> None:
         print("[camera] Warning: no active viewport found")
         return
     viewport.set_active_camera(camera_path)
-
-
-def get_prim_world_transform(stage: Usd.Stage, prim_path: str) -> np.ndarray:
-    """Return the 4x4 column-vector-convention world transform of a USD prim."""
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        raise RuntimeError(f"Prim not found: {prim_path}")
-    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    gf_mat = cache.GetLocalToWorldTransform(prim)
-    return np.array(gf_mat, dtype=float).T
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────

@@ -24,13 +24,16 @@ OUTPUT_DIR   = PROJECT_ROOT / "outputs"
 
 
 # ── Capture rate ──────────────────────────────────────────────────────────────
-# Frame rate at which the current generation of H5 datasets is recorded.
-# All replay / capture scripts default to this so MP4 outputs play back at
-# the same speed as the source recording. Older 50 Hz datasets exist (e.g.
-# the `*_50hz` files referenced in README §1); override via the shared
-# ``--fps`` CLI flag (added by ``utils.app.add_common_args``) when you
-# replay one of those.
-H5_DEFAULT_FPS = 10.0   # Hz — H5 capture / MP4 output frame rate.
+# Frame rate at which the egoverse H5 datasets are recorded. All replay /
+# capture scripts default to this so MP4 outputs play back at the same
+# speed as the source recording. Override via the shared ``--fps`` CLI
+# flag (added by ``utils.app.add_common_args``) if you point a script at
+# an H5 captured at a different rate.
+#
+# When ``--sample-every N`` is also passed, the writer's effective fps is
+# ``H5_DEFAULT_FPS / N``: e.g. ``--sample-every 5`` on 50 Hz data gives
+# a 10 Hz output video (recording every fifth simulated frame).
+H5_DEFAULT_FPS = 50.0   # Hz — H5 capture / MP4 output frame rate.
 
 
 # ── Prim paths ────────────────────────────────────────────────────────────────
@@ -153,9 +156,9 @@ ARIA_EXTRINSICS_RIGHT = np.array([
 
 
 # ── Table-edge geometry for desk-based extrinsic refinement ───────────────────
-# The refiner (scripts/calibrate_extrinsic_table.py) aligns 3D table edges
-# projected through the current camera to 2D SAM-mask lines extracted from
-# the recorded video. The three line segments below must match the
+# The refiner (``utils.calibrate_table.refine_aria_extrinsic``) aligns 3D
+# table edges projected through the current camera to 2D SAM-mask lines
+# extracted from the recorded video. The three line segments below must match the
 # parametric ``TableConfig`` defaults (1.0 × 1.4 m centred at origin, top
 # at z = 0.75). If you change ``TableConfig`` and want desk refinement to
 # stay valid, rebuild these from the config — but for the default scene

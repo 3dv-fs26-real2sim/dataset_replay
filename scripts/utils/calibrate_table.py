@@ -1,26 +1,149 @@
-"""Library code for the desk-based Aria extrinsic calibration.
+"""Desk-based Aria extrinsic calibration — library + one-call entry point.
 
-Two pieces, deliberately kept together because they're only ever called
-from ``scripts/calibrate_extrinsic_table.py``:
+Public entry points (most callers only need these two):
 
-  1. **SAM line extraction** — ``extract_feature_lines`` reads an aggregated
-     per-pixel SAM table-mask probability map and RANSAC-fits three
-     implicit 2D lines (top edge, left edge, table seam) used as the
-     measurement targets.
+  * ``compute_nominal_aria_pose(cfg)`` — pure math from ``SceneConfig``;
+    returns ``T_world_cam = T_world_base @ ARIA_EXTRINSICS_RIGHT``.
+  * ``refine_aria_extrinsic(sam_mask_path, cfg)`` — loads the SAM table-mask
+    NPZ, extracts three feature lines, runs LM refinement off the nominal
+    pose, returns the refined ``T_world_cam`` and delta stats.
 
-  2. **SE(3) pose refinement** — ``refine_world_pose`` runs Levenberg-
-     Marquardt over a 6-DOF twist correction, with the residual per
-     sampled point on each 3D line being the signed perpendicular
-     distance to the corresponding 2D line. ``se3_from_twist`` and
-     ``project_world_points`` are the standalone helpers it uses.
+Internals (kept module-public so the experiments folder can reuse them):
+
+  * ``extract_feature_lines`` — per-pixel SAM frequency → top/left/seam 2D
+    lines via RANSAC.
+  * ``refine_world_pose`` — generic LM over a 6-DOF twist correction aligning
+    sampled 3D-line points to 2D image lines.
+  * ``project_world_points``, ``se3_from_twist``, ``intrinsics_matrix`` —
+    helpers reused by diagnostics in ``3dv/experiments/table_align_egoverse/``.
 
 Pure numpy + scipy. No Isaac Sim, no pxr.
 """
 
+from pathlib import Path
 from typing import Iterable, Optional
 
 import numpy as np
 from scipy.optimize import least_squares
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level entry points
+# ─────────────────────────────────────────────────────────────────────────────
+def intrinsics_matrix(intrinsics: dict) -> np.ndarray:
+    """Build the 3×3 K from a ``CameraConfig.intrinsics`` dict."""
+    return np.array([
+        [intrinsics["fx"],            0.0, intrinsics["cx"]],
+        [           0.0, intrinsics["fy"], intrinsics["cy"]],
+        [           0.0,            0.0,             1.0],
+    ])
+
+
+def compute_nominal_aria_pose(cfg) -> np.ndarray:
+    """Return ``T_world_cam`` from ``cfg`` alone — no live USD stage needed.
+
+    Computed as ``T_world_base @ ARIA_EXTRINSICS_RIGHT`` where
+    ``T_world_base`` is the wrapper's effective pose: translation
+    ``cfg.robot.mount_xyz`` and rotation from ``cfg.robot.mount_rpy``
+    (identity by default). Matches what ``scene._add_robot`` places the
+    kinematic ``panda_link0`` at, so the result is identical to reading
+    the prim's world transform off a built stage.
+    """
+    from .constants import ARIA_EXTRINSICS_RIGHT     # local import: pure-py
+
+    T_world_base = np.eye(4)
+    T_world_base[:3, 3] = np.asarray(cfg.robot.mount_xyz, dtype=float)
+    if any(r != 0.0 for r in cfg.robot.mount_rpy):
+        from scipy.spatial.transform import Rotation
+        T_world_base[:3, :3] = Rotation.from_euler(
+            "XYZ", cfg.robot.mount_rpy
+        ).as_matrix()
+    return T_world_base @ np.asarray(ARIA_EXTRINSICS_RIGHT, dtype=float)
+
+
+def refine_aria_extrinsic(sam_mask_path: Path, cfg) -> dict:
+    """Run desk-based extrinsic refinement on a SAM table-mask NPZ.
+
+    Loads ``sam_mask_path`` (must contain key ``mask`` of shape ``(N, H, W)``
+    in ``{0, 1}``), aggregates into a per-pixel frequency map, extracts the
+    three table-edge lines, and refines the nominal Aria pose (from
+    :func:`compute_nominal_aria_pose`) by LM-fitting against those lines.
+
+    Returns a dict::
+
+        {
+            'T_world_cam':           (4, 4) refined pose,
+            'T_world_cam_nominal':   (4, 4) starting pose,
+            'xi':                    (6,)  LM twist correction,
+            'residual_rms_px':       float scalar,
+            'delta_pos_mm':          (3,)  refined - nominal translation in mm,
+            'delta_rot_deg':         float rotation angle in degrees,
+            'message':               scipy LM termination message,
+        }
+
+    Raises ``KeyError`` if the NPZ is missing ``mask`` and ``RuntimeError`` if
+    any of the three feature lines couldn't be extracted from the mask.
+    """
+    from .constants import (                          # local import: pure-py
+        TABLE_LEFT_EDGE_WORLD,
+        TABLE_SEAM_WORLD,
+        TABLE_TOP_EDGE_WORLD,
+    )
+
+    sam_mask_path = Path(sam_mask_path)
+    with np.load(sam_mask_path) as d:
+        if "mask" not in d.files:
+            raise KeyError(
+                f"{sam_mask_path} missing required key 'mask' "
+                f"(found: {d.files})"
+            )
+        masks = d["mask"]
+    if masks.ndim != 3:
+        raise ValueError(f"Expected SAM masks of shape (N, H, W); got {masks.shape}")
+
+    sam_freq = masks.astype(np.float32).mean(axis=0)
+    T_nominal = compute_nominal_aria_pose(cfg)
+    K = intrinsics_matrix(cfg.camera.intrinsics)
+
+    # Predict the seam search band from the nominal pose so we adapt when
+    # the nominal drifts between sessions; ±100 px around the projected
+    # seam midpoint is the standard window from the dev/experiments work.
+    pix, _ = project_world_points(T_nominal, TABLE_SEAM_WORLD, K)
+    u_mid = float(0.5 * (pix[0, 0] + pix[1, 0]))
+    img_w = int(K[0, 2] * 2)
+    seam_u_range = (
+        max(0, int(u_mid) - 100),
+        min(img_w, int(u_mid) + 100),
+    )
+
+    feat = extract_feature_lines(sam_freq, seam_u_range=seam_u_range)
+    for key in ("top", "left", "seam"):
+        if feat[key] is None:
+            raise RuntimeError(
+                f"Could not extract '{key}' line from SAM mask "
+                f"{sam_mask_path.name}; check the mask coverage or pass a "
+                f"hand-tuned seam_u_range."
+            )
+
+    result = refine_world_pose(
+        T_nominal, K,
+        [
+            (TABLE_TOP_EDGE_WORLD,  feat["top"]),
+            (TABLE_LEFT_EDGE_WORLD, feat["left"]),
+            (TABLE_SEAM_WORLD,      feat["seam"]),
+        ],
+    )
+
+    # Convenience stats for the caller's log line.
+    T = result["T_world_cam"]
+    dp = T[:3, 3] - T_nominal[:3, 3]
+    R_delta = T[:3, :3] @ T_nominal[:3, :3].T
+    rot_deg = float(np.rad2deg(np.arccos(
+        np.clip((np.trace(R_delta) - 1) / 2.0, -1.0, 1.0))))
+
+    result["delta_pos_mm"] = dp * 1000.0
+    result["delta_rot_deg"] = rot_deg
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

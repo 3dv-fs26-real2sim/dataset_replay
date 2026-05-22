@@ -15,7 +15,10 @@ instead of the observation qpos arrays.
 Unlike maple's OakD recordings, egoverse H5s do **not** carry per-frame
 camera intrinsics or extrinsics: the Aria intrinsics are static (stored
 in ``utils.constants.ARIA_INTRINSICS``) and the extrinsic is computed at
-runtime from the right-arm base via ``utils.camera.compute_aria_world_pose``.
+runtime from the right-arm base via
+``utils.calibrate_table.compute_nominal_aria_pose`` — optionally refined
+on the fly by ``utils.calibrate_table.refine_aria_extrinsic`` from a SAM
+table mask under ``data/egoverse/desk/``.
 
 Only depends on h5py and numpy — no Isaac Sim imports.
 """

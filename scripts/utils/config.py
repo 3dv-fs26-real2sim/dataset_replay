@@ -9,9 +9,9 @@ Compared to ``maple`` this branch:
   * drops the AprilTag plane (no ``AprilTagConfig`` and no AprilTag-based PnP);
   * swaps the world-fixed OakD camera for an Aria glasses camera whose pose
     is computed at runtime as ``T_world_base @ ARIA_EXTRINSICS_RIGHT`` from
-    :mod:`utils.constants`. An optional desk-based refinement (SAM table
-    masks → LM 6-DOF correction, see ``scripts/calibrate_extrinsic_table.py``)
-    can override that pose via ``world_pose_override`` on ``setup_camera``.
+    :mod:`utils.constants`, optionally refined on the fly from a SAM table
+    mask via ``utils.calibrate_table.refine_aria_extrinsic`` (the replay
+    script auto-finds the mask under ``data/egoverse/desk/<stem>_desk.npz``).
 
 Coordinate convention
 ---------------------
@@ -103,21 +103,31 @@ class TableConfig:
 class RobotMountConfig:
     """World pose of the wrapper Xform that references the USD's /Root.
 
-    Defaults place ``panda_link0`` at:
+    Defaults place ``panda_link0`` at ``(-0.246, -0.350, 0.75)`` — the
+    maple-branch value, chosen after a 5-variant sweep (see
+    ``3dv/experiments/table_align_egoverse/run_mount_sweep.sh``) gave it
+    the best sim-vs-real Aria overlay alignment on the egoverse
+    ``20250804_104715`` session.
 
-      * laterally: centre of the RIGHT table (Y = -table.single_size_xy[1] / 2)
-      * axially:   24.5cm from the back edge to the link0 origin
-      * vertically: on the table top (Z = top_z)
+    Origin of the number: measured "back of robot puck at world x = -0.40"
+    plus the 154 mm link0-mesh extent (the Panda's ``panda_link0`` visual
+    mesh sticks 154 mm behind the kinematic origin, measured from
+    ``pandaorca_description/meshes/franka/fer/visual/link0.dae``).
+    Main's baked-USD value (-0.262, -0.386, 1.0) was an approximation
+    that ran ~36 mm off in Y and ~16 mm off in X in overlay.
 
-    yielding ``(-0.255, -0.35, 0.75)`` with the default table.
+    Relative to the parametric table:
+      * X: 0.254 m in from the back edge (x=+0.5).
+      * Y: at the geometric centre of the right cell
+        (Y = -table.single_size_xy[1] / 2 = -0.35).
 
-    NOTE: ``panda_link0`` has a non-trivial local translate inside the USD
-    ``(-0.00761, -0.00027, -0.47602)``. The wrapper transform must subtract
-    this so panda_link0's *origin* lands at ``mount_xyz``. Both the mount xyz
-    and the USD-internal offset are exposed here so the math is fully
-    inspectable.
+    NOTE: ``panda_link0`` has a non-trivial local translate inside the
+    orcav1b USD ``(-0.00761, -0.00027, -0.47602)``. The wrapper transform
+    must subtract this so panda_link0's *origin* lands at ``mount_xyz``.
+    Both the mount xyz and the USD-internal offset are exposed here so
+    the math is fully inspectable.
     """
-    mount_xyz: tuple[float, float, float] = (-0.255, -0.35, 0.75)
+    mount_xyz: tuple[float, float, float] = (-0.246, -0.350, 0.75)
     mount_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
     panda_link0_local_translate: tuple[float, float, float] = (
         -0.007610592991113663,
@@ -142,9 +152,11 @@ class CameraConfig:
     absolute table-top Z (0.75 vs main's 1.0) differs, and that's absorbed
     by the world composition.
 
-    A per-session refinement (desk-based, SAM-mask driven) can override
-    this pose by passing ``world_pose_override`` to ``setup_camera`` — see
-    ``scripts/calibrate_extrinsic_table.py``.
+    A per-session refinement (desk-based, SAM-mask driven) absorbs the
+    head-pose drift between sessions — see
+    ``utils.calibrate_table.refine_aria_extrinsic``. The replay scripts
+    auto-call it when a mask is present at
+    ``data/egoverse/desk/<h5_stem>_desk.npz``.
     """
     name:   str  = "aria_rgb_cam"
     width:  int  = ARIA_INTRINSICS["width"]
