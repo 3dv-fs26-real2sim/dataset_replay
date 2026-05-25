@@ -2,7 +2,7 @@
 
 Public entry points (most callers only need these two):
 
-  * ``compute_nominal_aria_pose(cfg)`` — pure math from ``SceneConfig``;
+  * ``compute_nominal_aria_pose(cfg)`` — pure math from an egoverse SceneConfig;
     returns ``T_world_cam = T_world_base @ ARIA_EXTRINSICS_RIGHT``.
   * ``refine_aria_extrinsic(sam_mask_path, cfg)`` — loads the SAM table-mask
     NPZ, extracts three feature lines, runs LM refinement off the nominal
@@ -31,7 +31,7 @@ from scipy.optimize import least_squares
 # Top-level entry points
 # ─────────────────────────────────────────────────────────────────────────────
 def intrinsics_matrix(intrinsics: dict) -> np.ndarray:
-    """Build the 3×3 K from a ``CameraConfig.intrinsics`` dict."""
+    """Build the 3×3 K from a ``camera.intrinsics`` dict."""
     return np.array([
         [intrinsics["fx"],            0.0, intrinsics["cx"]],
         [           0.0, intrinsics["fy"], intrinsics["cy"]],

@@ -2,7 +2,7 @@
 
 This module is intentionally narrow: it takes a 4×4 ``T_world_cam`` (computed
 by the caller — typically :mod:`utils.calibrate_table`) and configures a
-``UsdGeom.Camera`` prim with pinhole intrinsics from ``CameraConfig``. The
+``UsdGeom.Camera`` prim with pinhole intrinsics from ``BaseCameraConfig``. The
 caller decides whether that pose is the nominal base-relative one or a
 SAM-refined one; this module doesn't read the stage to derive it, keeping
 the pose used here in lock-step with the pose downstream consumers
@@ -17,7 +17,7 @@ from __future__ import annotations
 import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
-from .config import CameraConfig
+from .config import BaseCameraConfig
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
 # Diag(1, -1, -1, 1) flips Y and Z to convert between the two.
@@ -25,7 +25,7 @@ _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
-def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
+def setup_camera(stage: Usd.Stage, cfg: BaseCameraConfig,
                  *, prim_path: str | None = None,
                  world_pose_override: np.ndarray) -> str:
     """Create a UsdGeom.Camera at ``world_pose_override`` and make it the
@@ -37,6 +37,9 @@ def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
     based refinement). This module deliberately doesn't reach into the
     stage to derive it, so the camera doesn't get out of sync with what
     other code (object trajectory composition, diagnostics) sees.
+
+    The rendered FOV comes from ``cfg.intrinsics`` (the doc K). PnP uses
+    the same K, so the sim viewport matches the recorded video.
     """
     _check_intrinsics(cfg.intrinsics)
 
@@ -57,7 +60,7 @@ def setup_camera(stage: Usd.Stage, cfg: CameraConfig,
 
 
 def create_camera_prim(stage: Usd.Stage, prim_path: str,
-                       world_pose: np.ndarray, cfg: CameraConfig) -> str:
+                       world_pose: np.ndarray, cfg: BaseCameraConfig) -> str:
     """Create a UsdGeom.Camera with the given world pose and pinhole intrinsics.
 
     The world pose is in OpenCV camera convention (+Z forward); a CV→USD
@@ -113,8 +116,8 @@ def _check_intrinsics(K: dict) -> None:
     missing = [k for k in ("fx", "fy", "cx", "cy") if K.get(k, 0.0) == 0.0]
     if missing:
         raise ValueError(
-            f"Aria intrinsics keys {missing} are zero. Fill "
-            f"SceneConfig.camera.intrinsics from the factory calibration "
+            f"Camera intrinsics keys {missing} are zero. Fill "
+            f"cfg.camera.intrinsics from the factory calibration "
             f"before running."
         )
 

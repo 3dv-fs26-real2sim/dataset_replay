@@ -1,58 +1,31 @@
-"""Scene configuration for the egoverse (single-arm, Aria, no walls/AprilTag) branch.
+"""Base scene configuration shared by both Maple and Egoverse datasets.
 
-Pure-Python, no Isaac Sim imports — safe to import before SimulationApp is
-created. The SceneConfig dataclass is the *single source of truth* for every
-scene parameter the procedural builder, robot setup, and camera setup read.
+Pure-Python — safe to import before SimulationApp is created.
 
-Compared to ``maple`` this branch:
-  * drops the U-shape walls (no ``WallsConfig``);
-  * drops the AprilTag plane (no ``AprilTagConfig`` and no AprilTag-based PnP);
-  * swaps the world-fixed OakD camera for an Aria glasses camera whose pose
-    is computed at runtime as ``T_world_base @ ARIA_EXTRINSICS_RIGHT`` from
-    :mod:`utils.constants`, optionally refined on the fly from a SAM table
-    mask via ``utils.calibrate_table.refine_aria_extrinsic`` (the replay
-    script auto-finds the mask under ``data/egoverse/desk/<stem>_desk.npz``).
+This module defines only the *base* dataclasses (`TableConfig`,
+`RobotMountConfig`, `BaseCameraConfig`, `BaseSceneConfig`) and a
+`select_config()` dispatcher. Concrete configs live in:
 
-Coordinate convention
----------------------
+  * ``utils.config_maple``     — OakD camera, walls, AprilTag
+  * ``utils.config_egoverse``  — Aria camera, open desk, SAM table refinement
+
+Shared modules (`scene.py`, `camera.py`, `robot.py`, …) consume
+`BaseSceneConfig` and dispatch on its decision hooks
+(`has_walls()`, `has_apriltag()`, `viewport_size()`).
+
+Coordinate convention (identical for both rigs)
+-----------------------------------------------
 * World frame: Z-up, 1 m units.
 * Combined table surface centred at world origin in XY, top at ``Z = top_z``.
-* ``+X`` points away from the operator/camera (toward where the back wall
-  used to be in maple); the robot's ``panda_link0`` faces ``+X``.
-* ``-X`` points toward the open side, where the Aria wearer sits.
+* ``+X`` points away from the operator/camera; the robot's ``panda_link0``
+  faces ``+X``. Maple's open side (and egoverse's wearer) sit at ``-X``.
 * ``+Y`` points toward the **left** table cell; ``-Y`` toward the **right**.
-
-Geometry sketch (top-down)
---------------------------
-::
-
-                              +X (robot faces this direction)
-                                ^
-                                |
-              ==================================
-              |                                |
-              |                                |
-              |                  panda_link0   |      Combined surface:
-              |  LEFT TABLE      RIGHT TABLE   |      X in [-0.50, +0.50]  (1.00 m)
-              |  70 x 100 cm     70 x 100 cm   |      Y in [-0.70, +0.70]  (1.40 m)
-       +Y <---|                                |---> -Y      top at Z = 0.75 m
-              |                                |
-              |                                |
-              |                                |
-              ==================================
-                                |
-                                v
-                              -X  (Aria wearer sits here, looking +X)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import numpy as np
-
-from .constants import ARIA_EXTRINSICS_RIGHT, ARIA_INTRINSICS
 
 
 # ── Path anchors ──────────────────────────────────────────────────────────────
@@ -66,7 +39,7 @@ class TableConfig:
     """Two tables placed side-by-side along the Y axis.
 
     Default: each cell is 1.00 m (X) × 0.70 m (Y), so the combined surface
-    is 1.00 × 1.40 m centred at the world origin.
+    is 1.00 × 1.40 m centred at the world origin. Identical across rigs.
     """
     single_size_xy: tuple[float, float] = (1.00, 0.70)   # (Lx, Ly) of ONE table
     n_tables:       int = 2                              # tiled along +Y/-Y
@@ -103,23 +76,12 @@ class TableConfig:
 class RobotMountConfig:
     """World pose of the wrapper Xform that references the USD's /Root.
 
-    Defaults place ``panda_link0`` at ``(-0.246, -0.350, 0.75)`` — the
-    maple-branch value, chosen after a 5-variant sweep (see
-    ``3dv/experiments/table_align_egoverse/run_mount_sweep.sh``) gave it
-    the best sim-vs-real Aria overlay alignment on the egoverse
-    ``20250804_104715`` session.
-
-    Origin of the number: measured "back of robot puck at world x = -0.40"
-    plus the 154 mm link0-mesh extent (the Panda's ``panda_link0`` visual
-    mesh sticks 154 mm behind the kinematic origin, measured from
-    ``pandaorca_description/meshes/franka/fer/visual/link0.dae``).
-    Main's baked-USD value (-0.262, -0.386, 1.0) was an approximation
-    that ran ~36 mm off in Y and ~16 mm off in X in overlay.
-
-    Relative to the parametric table:
-      * X: 0.254 m in from the back edge (x=+0.5).
-      * Y: at the geometric centre of the right cell
-        (Y = -table.single_size_xy[1] / 2 = -0.35).
+    Per-dataset defaults are set by `MapleSceneConfig` / `EgoverseSceneConfig`
+    (they construct this dataclass with different `mount_xyz` values because
+    the May-2026 overlay comparison showed each rig aligns best at its own
+    value: maple at `-0.255` X, egoverse at `-0.246` X). The field default
+    below is just a placeholder so the dataclass is instantiable on its own;
+    production scene configs always override it.
 
     NOTE: ``panda_link0`` has a non-trivial local translate inside the
     orcav1b USD ``(-0.00761, -0.00027, -0.47602)``. The wrapper transform
@@ -127,7 +89,7 @@ class RobotMountConfig:
     Both the mount xyz and the USD-internal offset are exposed here so
     the math is fully inspectable.
     """
-    mount_xyz: tuple[float, float, float] = (-0.246, -0.350, 0.75)
+    mount_xyz: tuple[float, float, float] = (-0.255, -0.35, 0.75)
     mount_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
     panda_link0_local_translate: tuple[float, float, float] = (
         -0.007610592991113663,
@@ -138,72 +100,74 @@ class RobotMountConfig:
 
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class CameraConfig:
-    """Aria glasses camera, posed relative to the right-arm base.
+class BaseCameraConfig:
+    """Common pinhole-camera fields. Subclasses add pose-resolution hooks.
 
-    Unlike the ``maple`` OakD setup (world-fixed, loaded from an AprilTag-PnP
-    NPZ), the egoverse Aria pose is computed at runtime as
-
-        T_world_cam = T_world_panda_link0 @ ARIA_EXTRINSICS_RIGHT
-
-    using the constants in :mod:`utils.constants`. The wearer sits in the
-    same place relative to the robot across sessions, so the right-base
-    extrinsic carries verbatim from the main-branch capture rig — only the
-    absolute table-top Z (0.75 vs main's 1.0) differs, and that's absorbed
-    by the world composition.
-
-    A per-session refinement (desk-based, SAM-mask driven) absorbs the
-    head-pose drift between sessions — see
-    ``utils.calibrate_table.refine_aria_extrinsic``. The replay scripts
-    auto-call it when a mask is present at
-    ``data/egoverse/desk/<h5_stem>_desk.npz``.
+    Concrete subclasses live in `config_maple.OakDCameraConfig` (carries a
+    nominal world-fixed lookat pose) and `config_egoverse.AriaCameraConfig`
+    (carries a base-relative `t_base_cam()` extrinsic).
     """
-    name:   str  = "aria_rgb_cam"
-    width:  int  = ARIA_INTRINSICS["width"]
-    height: int  = ARIA_INTRINSICS["height"]
-
-    intrinsics: dict = field(default_factory=lambda: {
-        "fx": ARIA_INTRINSICS["fx"],
-        "fy": ARIA_INTRINSICS["fy"],
-        "cx": ARIA_INTRINSICS["cx"],
-        "cy": ARIA_INTRINSICS["cy"],
-    })
-
-    # OpenCV (k1, k2, p1, p2, k3). The Aria pipeline rectifies upstream, so
-    # the simulated pinhole render uses zero distortion.
+    name:       str = ""
+    width:      int = 0
+    height:     int = 0
+    intrinsics: dict = field(default_factory=dict)            # {"fx","fy","cx","cy"}
     distortion: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.0)
-
-    # The base-relative Aria pose. Stored as a method on the dataclass so
-    # changing it (e.g., re-measuring) doesn't require touching every call
-    # site. ``T_base_cam`` is what gets left-multiplied by ``T_world_base``.
-    def t_base_cam(self) -> np.ndarray:
-        """4×4 column-vector transform: camera in the right-arm-base frame."""
-        return np.asarray(ARIA_EXTRINSICS_RIGHT, dtype=float)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
-class SceneConfig:
-    """Top-level config aggregating all scene parameters."""
-    table:  TableConfig      = field(default_factory=TableConfig)
-    robot:  RobotMountConfig = field(default_factory=RobotMountConfig)
-    camera: CameraConfig     = field(default_factory=CameraConfig)
+class BaseSceneConfig:
+    """Top-level scene config.
+
+    Concrete subclasses set the camera type, flip the
+    `has_walls() / has_apriltag()` switches, and override `viewport_size()`
+    if the rig wants something other than 16:9.
+    """
+    dataset: str = ""                                    # "maple" | "egoverse"
+    table:   TableConfig      = field(default_factory=TableConfig)
+    robot:   RobotMountConfig = field(default_factory=RobotMountConfig)
+    camera:  BaseCameraConfig = field(default_factory=BaseCameraConfig)
 
     robot_asset_path: Path = ASSETS / "orcav1b_franka_vmnt_v10_flattened.usd"
     urdf_path:        Path = ASSETS / "urdf" / "panda_arm.urdf"
     lula_descriptor:  Path = ASSETS / "lula" / "panda_arm_descriptor.yaml"
 
-    # ------------------------------------------------------------------ helpers
+    # ── Decision hooks shared modules read ───────────────────────────────────
+    def has_walls(self) -> bool:
+        return False
+
+    def has_apriltag(self) -> bool:
+        return False
+
+    def viewport_size(self) -> tuple[int, int]:
+        return (1280, 720)
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
     def default_mount_xyz(self) -> tuple[float, float, float]:
-        """Recompute the default mount xyz from current table dims.
+        """Canonical "centre of right table, 10 cm from back edge" position.
 
         Useful when the user changes ``table.single_size_xy`` or ``n_tables``
-        and wants to reset ``robot.mount_xyz`` to the canonical "centre of
-        right table, 10 cm from back edge" position. Not auto-called — kept
-        explicit so the user sees the dependency.
+        and wants a reasonable starting `robot.mount_xyz`. Not auto-called —
+        kept explicit so the user sees the dependency.
         """
         return (
-            self.table.x_extent[0] + 0.10,           # 10 cm from back edge
-            self.table.right_table_centre_y,         # centre of right table
+            self.table.x_extent[0] + 0.10,
+            self.table.right_table_centre_y,
             self.table.top_z,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def select_config(dataset: str) -> BaseSceneConfig:
+    """Dispatch a dataset name → concrete SceneConfig instance.
+
+    Imports the concrete module lazily so neither dataset's module is
+    imported until its config is actually requested.
+    """
+    if dataset == "maple":
+        from .config_maple import MapleSceneConfig
+        return MapleSceneConfig()
+    if dataset == "egoverse":
+        from .config_egoverse import EgoverseSceneConfig
+        return EgoverseSceneConfig()
+    raise ValueError(f"unknown dataset: {dataset!r}")

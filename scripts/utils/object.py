@@ -3,9 +3,11 @@
 Simplified for the new minimal branch:
 * Objects are spawned in **kinematic, no-collision** mode by default —
   trajectories drive them; PhysX never integrates contact for them.
-* No object-pose-version registry, no camera-frame-to-world transformation,
-  no D6 tracking joints, no collision-pair filtering. Trajectories are
-  expected in **world frame** directly (``poses.load_pose_trajectory``).
+* No object-pose-version registry, no D6 tracking joints, no collision-pair
+  filtering. ``set_object_world_pose`` consumes a **world-frame** ``T_world_obj``;
+  the replay scripts compose camera-frame trajectories (the default — a 6D
+  pose estimator outputs ``T_cam_obj``) with ``T_world_cam`` before calling
+  here.
 
 Depends on pxr / Isaac Sim — must be imported after SimulationApp is created.
 """

@@ -1,136 +1,352 @@
 # dataset_replay
 
+Single-arm **kinematic replay** of teleoperated manipulation recordings in
+Isaac Sim. Given an H5 trajectory, it rebuilds the capture scene, drives a
+Panda + OrcaHand robot through the recorded motion frame-by-frame, optionally
+replays a tracked object, and renders the result — including sim/real overlays
+for visually checking calibration.
+
+Two recording rigs share one codebase:
+
+- **Maple** — OAK-D camera, U-shape walls, an AprilTag on the table.
+- **Egoverse** — Aria glasses (head-mounted), open desk (no walls, no tag).
+
+The codebase is split so the two rigs share the entire scene / robot / IK /
+capture stack via dataclass-typed configs; the only dataset-specific code is
+the two replay scripts plus the per-rig calibration library. Calibration runs
+**in-process at startup** against the H5 image data — there are no on-disk
+extrinsic artefacts to manage.
+
+---
+
+## The two rigs: Maple vs Egoverse
+
+Both rigs replay the **same robot** (7-DOF Franka Panda arm + 17-DOF right
+OrcaHand) on the **same scene** (two 1.0 × 0.7 m tables side-by-side, combined
+surface 1.0 × 1.4 m centred at the world origin, top at `Z = 0.75 m`), using
+the **same IK solver** and the **same capture pipeline**. They differ only in
+the camera, the surrounding scene furniture, and the calibration method:
+
+| | **Maple** | **Egoverse** |
+|---|---|---|
+| Camera | OAK-D Pro AF, **world-fixed** above the open −X edge | Aria glasses, **head-mounted**, posed relative to the robot base |
+| Intrinsics | doc K, `fx=fy=367.16` @ 480×270 | `fx=fy=266.51` @ 640×480 |
+| Render viewport | 1280×720 (16:9) | 1280×960 (2× 640×480, 4:3) |
+| Scene furniture | U-shape **walls** + **AprilTag** flat on the table | open desk — **no walls, no tag** |
+| Calibration | AprilTag detect + joint PnP/RANSAC, scanning the H5 video | SAM table-mask edge fit + LM refinement |
+| Calibration input | the H5 image stream itself (in-process) | `data/egoverse/desk/<stem>_desk.npz` |
+| Nominal-pose fallback | configured OakD lookat pose | `T_world_base @ ARIA_EXTRINSICS_RIGHT` |
+| H5 arm key | `observations/qpos_arm_right` | `observations/qpos_arm` |
+| H5 hand key | `observations/qpos_hand_right` | `observations/qpos_hand` |
+| H5 image key | `observations/images/oakd_front_view/color` | `observations/images/aria_rgb_cam/color` |
+| Top-level actions | none | `actions_arm` / `actions_hand` (`--use-actions`) |
+| Per-frame extrinsics in H5 | yes (`T_robot_cam`) | no |
+| Per-frame intrinsics in H5 | yes | no (static, in `constants.py`) |
+| Object-trajectory frame (default) | `camera` (`T_cam_obj`) | `camera` (`T_cam_obj`) |
+| Capture rate | 10 Hz | 50 Hz |
+| Robot mount xyz | `(-0.255, -0.35, 0.75)` | `(-0.246, -0.350, 0.75)` |
+
+The split is enforced structurally: shared modules consume a
+`BaseSceneConfig` and branch on its decision hooks `cfg.has_walls()`,
+`cfg.has_apriltag()`, `cfg.viewport_size()` — never on `isinstance`. Maple
+flips both walls/tag hooks on; Egoverse leaves them off. See
+`utils/config_maple.py` and `utils/config_egoverse.py` for the concrete
+values, and the geometry sketches in each.
+
+---
+
 ## Setup
 
-Create a conda environment and install the dependencies. What I prefer to do is install Isaac Sim and all dependencies into a single conda environment. If you have a different installation method for Isaac Sim, you would need to link it somehow. For the dependencies in requirements.txt, I may have missed some out -- please add any additional dependencies needed, and install new dependencies as you go when you run into errors.
+Create a conda environment and install the dependencies. I prefer installing
+Isaac Sim and all dependencies into a single conda env. If you have a
+different installation method for Isaac Sim you would need to link it
+somehow.
 
 ```bash
-# Create and activate conda environment
 conda create -n 3dv python=3.11
 conda activate 3dv
 
-# Install Isaac Sim (https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html)
+# Isaac Sim (https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html)
 pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
 
-# Install other dependencies
 pip install -r requirements.txt
 ```
 
-Download h5 files from Euler cluster. I chose object_in_bowl_processed_50hz/20250804_104715.h5 bag_groceries/20250829_180500.h5 as they were the smallest files. You can try other files too.
+Data goes under `data/<dataset>/`:
+
+- H5 recordings → `data/<dataset>/h5/`
+- object pose trajectories → `data/<dataset>/pose/`
+- SAM table masks (egoverse only) → `data/egoverse/desk/<h5_stem>_desk.npz`
+
+Object meshes live under `objects/<name>/<name>.obj` (e.g. `objects/duck/`,
+`objects/pan/`).
+
+---
+
+## How kinematic replay works
+
+"Kinematic" means **nothing is dynamically simulated**: the robot's joints are
+*set* directly each frame and the object's pose is *prescribed* each frame.
+PhysX never integrates contact forces or gravity for the driven bodies — they
+follow the recorded trajectory exactly, with no drift, no settling, no
+collision response. This is what makes a replay a faithful playback of the
+recording rather than a physics rollout.
+
+A run proceeds in four stages.
+
+### 1. Build the scene (`utils/scene.build_scene`)
+
+A fresh USD stage is created from scratch — Z-up, metric (1 m units) — and
+populated procedurally:
+
+- a physics scene with gravity along −Z (present but inert for the driven bodies),
+- a ground collision plane at `z = 0`,
+- a distant light,
+- `cfg.table.n_tables` cuboid table cells tiled along Y,
+- **walls** (Maple only, via `cfg.has_walls()`) — a U opening toward −X,
+- an **AprilTag** plane (Maple only, via `cfg.has_apriltag()`),
+- the **robot**, referenced from `assets/orcav1b_franka_vmnt_v10_flattened.usd`
+  with a wrapper transform that places `panda_link0` exactly at
+  `cfg.robot.mount_xyz`.
+
+`build_scene` is called with `robot_collision=False` for replay. That disables
+the articulation's self-collisions (`physxArticulation:enabledSelfCollisions =
+False`) and adds a `FilteredPairsAPI` against the tables, walls, and ground.
+The consequence: when a replayed pose makes the hand intersect the table or
+itself, PhysX does **not** push back — the joints stay exactly where they were
+teleported, so the robot never jitters.
+
+### 2. Set up the robot (`utils/robot.setup_robot`)
+
+The articulation (7 arm DOFs + 17 hand DOFs) is registered with the world, DOF
+indices are resolved by joint name, and a **home pose** is solved once with the
+Lula IK solver. `setup_robot` returns a `set_positions(wrist_pose, hand_q)`
+callable that the replay loop drives every frame.
+
+### 3. Resolve the camera pose (per-rig calibration)
+
+The camera's world pose `T_world_cam` is calibrated **once at startup** from the
+H5 data — no on-disk extrinsics:
+
+- **Maple** scans the H5 video for the AprilTag and runs joint PnP+RANSAC
+  against the tag's measured world pose (`utils/calibrate_april.py`).
+- **Egoverse** loads the SAM table mask and fits the table edges with LM
+  refinement off the nominal Aria extrinsic (`utils/calibrate_table.py`).
+
+Either falls back to a configured nominal pose if its input is unavailable (tag
+not detected / mask missing), and the resolved pose is written onto a USD
+camera prim that frames the rendered viewport.
+
+### 4. The replay loop
+
+The H5 yields, per frame: a wrist target `[x, y, z, qw, qx, qy, qz]` and 17
+hand joint angles. For each frame `i`:
+
+1. **Arm via IK.** The wrist quaternion is converted from the recording's
+   tool convention into the URDF convention (handedness flip + axis swap +
+   `Rx(180°)`, see `utils/rotation.tool_quat_to_urdf`). The IK target is shifted
+   from the recorded EE-wrist point back to `panda_link8`'s origin using
+   `EE_WRIST_OFFSET_IN_LINK8 = [0.13, 0, 0.07]`. Lula IK solves the 7 arm
+   joints, **warm-started** from the previous frame for temporal continuity. On
+   an IK failure the arm holds its previous joints and a counter is bumped
+   (reported at the end of the run).
+2. **Hand directly.** The 17 hand joints are set as `hand_home + q_hand` — no
+   IK, a straight joint copy.
+3. **Teleport.** `articulation.set_joint_positions(...)` writes the full joint
+   vector. This is a position *set*, not a torque command — hence "kinematic".
+4. **Object (optional).** If an object trajectory is loaded, the object prim is
+   teleported to `T_world_obj[i]` (`utils/object.set_object_world_pose`). The
+   object is a kinematic rigid body with gravity disabled and collision off, so
+   it too just follows its prescribed path.
+5. **Step + render.** `world.step(render=True)` advances one sim/render tick and
+   (if recording) the viewport frame is captured.
+
+The loop runs `min(n_h5_frames, n_object_frames)` frames.
+
+### Objects and trajectory frames
+
+Objects are spawned from `objects/<name>/<name>.obj` in **kinematic,
+no-collision** mode (`utils/object.spawn_object`). An object can be spawned
+without an `--h5` (handy for eyeballing placement); when a trajectory is
+supplied the per-frame poses override the static placement.
+
+Object trajectories are `(N, 4, 4)` stacks of homogeneous transforms in an
+`.npz` (single array). The 6D pose estimator outputs object poses in the
+**camera frame** (`T_cam_obj` per frame), so **both rigs default to `camera`**:
+each pose is composed at replay time as `T_world_obj = T_world_cam @ T_cam_obj`,
+landing the sim object where the real object was relative to the camera. This
+requires the camera to be set up (don't pass `--no-camera`).
+
+Pass `--object-traj-frame world` only for the rare NPZ that is already
+world-frame (used verbatim, no composition).
+
+### Recording outputs
+
+With recording flags, each replayed frame can be written to:
+
+- `--record-sim` — the raw Isaac Sim viewport,
+- `--record-sidebyside` — sim and the H5 frame placed side-by-side,
+- `--record-overlay A [B ...]` — sim alpha-blended over the H5 frame (one MP4
+  per alpha) — the primary tool for checking sim/real calibration.
+
+Output FPS is `--fps` (defaults to the per-rig capture rate), divided by
+`--sample-every N` if subsampling. The replay teleports joints once per H5
+frame regardless; only the *output video* is retimed.
+
+---
+
+## Usage
 
 ```bash
-# Copy with scp
-scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/object_in_bowl_processed_50hz/20250804_104715.h5 data/
+# ── Egoverse (Aria) ─────────────────────────────────────────────────────────
+# No --h5: build the scene, set home pose, hold (test_setup-style).
+python scripts/kinematic_replay_egoverse.py
 
-scp USERNAME@euler.ethz.ch:/cluster/work/cvg/data/Egoverse/raw_timesynced_h5/bag_groceries/20250829_180500.h5 data/
+# Full replay; SAM table-mask refines the Aria pose at startup if the mask
+# is present, else nominal pose with a warning.
+python scripts/kinematic_replay_egoverse.py --h5 data/egoverse/h5/20250804_104715.h5
+
+# Replay with the duck, driven by its tracked trajectory. --object-traj-frame
+# defaults to `camera`, matching the (1199, 4, 4) T_cam_obj duck NPZ; each pose
+# is composed with T_world_cam at replay time.
+python scripts/kinematic_replay_egoverse.py \
+    --h5 data/egoverse/h5/20250804_104715.h5 \
+    --object duck \
+    --object-traj data/egoverse/pose/20250804_104715_duck_vdahand.npz
+
+# Recorded overlay (headless).
+python scripts/kinematic_replay_egoverse.py --headless \
+    --h5 data/egoverse/h5/20250804_104715.h5 --record-overlay 0.5
+
+# Drive from top-level actions instead of recorded qpos.
+python scripts/kinematic_replay_egoverse.py \
+    --h5 data/egoverse/h5/20250804_104715.h5 --use-actions
+
+# ── Maple (OakD) ────────────────────────────────────────────────────────────
+# No --h5: scene + home pose, holds. OakD uses nominal lookat (no image, no calib).
+python scripts/kinematic_replay_maple.py
+
+# Full replay; AprilTag-PnP refines T_world_cam at startup by scanning the
+# H5 video (~5 s; full scan).
+python scripts/kinematic_replay_maple.py --h5 data/maple/h5/20250922_143954.h5
+
+# Skip the startup scan, use the configured nominal OakD lookat pose.
+python scripts/kinematic_replay_maple.py --h5 data/maple/h5/20250922_143954.h5 --no-calibrate
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+# Extract H5 camera video to MP4 (no GPU needed). FPS picked from camera
+# name prefix: oakd_* → 10, aria_* → 50. Override with --fps.
+python scripts/record_h5.py --h5 data/maple/h5/20250922_143954.h5 --camera oakd_front_view
+python scripts/record_h5.py --h5 data/egoverse/h5/20250804_104715.h5 --camera aria_rgb_cam
+
+# Spot-check the runtime calibration (writes NPZ + overlay PNG, optionally MP4).
+python scripts/calibrate/calibrate_april.py --h5 data/maple/h5/20250922_143954.h5 --viz-mp4
+python scripts/calibrate/calibrate_table.py --h5 data/egoverse/h5/20250804_104715.h5 --viz-mp4
 ```
 
-Download object 6d pose trajectory npz files, they should be in the format (N, 4, 4) where N is the number of frames and (4, 4) is the transform from camera to object. It should also match the number of frames in the h5 file. We generate them using depth estimation + FoundationPose. Move them to `data/`. File paths have been hard-coded as experimental code but you can change them. 
+All replay flags are documented inline (`python scripts/kinematic_replay_<dataset>.py --help`).
 
-Now run the replay file. **Make sure that the h5 file paths and USD file paths are correct.**
+---
 
-```bash
-# ── Setup & verification ──────────────────────────────────────────────────
-# Test home pose with duck object (defaults: --mode single --object duck)
-python scripts/test_setup.py
+## Calibration
 
-# Test home pose without object
-python scripts/test_setup.py --object none
+Both rigs auto-calibrate at startup from the H5 image stream. **No on-disk
+extrinsic files** — calibration is in-process every run.
 
-# Dual arm setup with camera preview
-python scripts/test_setup.py --mode dual --camera aria
+- **Maple**: `utils.calibrate_april.calibrate_from_h5` scans every H5 frame,
+  detects the AprilTag, runs joint PnP+RANSAC. ~5 s for a 300-frame recording.
+  Falls back to the nominal `OakDCameraConfig` lookat pose if the tag is
+  undetectable. Pass `--no-calibrate` to skip the scan entirely.
+- **Egoverse**: `utils.calibrate_table.refine_aria_extrinsic` loads
+  `data/egoverse/desk/<stem>_desk.npz`, extracts the top/left/seam edge fits,
+  runs LM refinement off `T_world_base @ ARIA_EXTRINSICS_RIGHT`. Falls back to
+  the nominal Aria pose if the mask file is missing. Pass `--no-refine` to skip.
 
-# ── Kinematic replay (object follows trajectory exactly, no physics) ──────
-# Default: single arm, duck object, aria camera
-python scripts/kinematic_replay.py
+> **Intrinsics note (Maple).** PnP and the sim render share **one** K — the
+> OAK-D spec-sheet ("doc") K, `fx=fy=367.16` at 480×270 — not the H5-stored K
+> (`fx≈299`). Both stages must use the same K, or the sim feed is zoomed
+> relative to the H5 in overlay/side-by-side videos. See
+> `OakDCameraConfig` for the rationale.
 
-# Record Isaac Sim viewport → outputs/20250804_104715_replay_qpos_duck.mp4
-python scripts/kinematic_replay.py --record-sim
+The diagnostic scripts under `scripts/calibrate/` invoke the same library
+functions and emit NPZ + overlay PNG/MP4 to `outputs/calibration/` for visual
+spot-checking.
 
-# Side-by-side comparison (Isaac Sim + H5 original)
-python scripts/kinematic_replay.py --record-comparison
-
-# Dual arm replay (no object)
-python scripts/kinematic_replay.py --mode dual
-
-# Without object spawning
-python scripts/kinematic_replay.py --object none
-
-# ── Dynamic replay (object follows physics with spring-damper tracking) ───
-# Default: single arm, duck object, aria camera, physics-enabled
-python scripts/dynamic_replay.py
-
-# Record with default stiffness/damping
-python scripts/dynamic_replay.py --record-sim
-
-# Higher stiffness for tighter trajectory tracking
-python scripts/dynamic_replay.py --stiffness 5000 --damping 500
-
-# Override object mass
-python scripts/dynamic_replay.py --object-mass 0.5
-
-# ── Utilities ─────────────────────────────────────────────────────────────
-# Extract original H5 camera video (no GPU needed)
-python scripts/record_h5.py
-```
-
-## Inspection of Dataset
-
-You can inspect the h5 files with `notebooks/inspect_h5.ipynb`. Feel free to modify or add any scripts. You should choose the kernel to be the conda environment you created.
+---
 
 ## Project Structure
 
 ```text
 scripts/
-├── test_setup.py              # Scene setup: IK home pose + optional object spawn + camera preview
-├── kinematic_replay.py        # Kinematic replay: object follows trajectory exactly (no physics)
-├── dynamic_replay.py          # Dynamic replay: object follows physics with D6 spring-damper tracking
-├── record_h5.py               # Extract H5 camera images to MP4 (no GPU needed)
-├── calculate_table_depth.py   # Compute camera→table-corner depths analytically (no GPU needed)
+├── kinematic_replay_maple.py     # Replay + auto-AprilTag-calib at startup
+├── kinematic_replay_egoverse.py  # Replay + auto-SAM-table-calib at startup
+├── record_h5.py                  # Schema-agnostic H5 → MP4 extractor
+├── calibrate/                    # Sanity-check tools (NPZ + overlay PNG/MP4)
+│   ├── calibrate_april.py
+│   └── calibrate_table.py
 └── utils/
-    ├── __init__.py            # Convenience re-exports (safe before SimulationApp)
-    ├── constants.py           # All shared constants (paths, joint names, home poses, etc.)
-    ├── app.py                 # SimulationApp creation + shared argparse flags
-    ├── robot.py               # Articulation setup, DOF index resolution
-    ├── rotation.py            # Quaternion math (pure numpy/scipy, no Isaac Sim deps)
-    ├── ik.py                  # IK solver creation, solving, position-setter factory
-    ├── h5_loader.py           # HDF5 trajectory loading
-    ├── poses.py               # 6D pose trajectory loader, frame transforms, pose averaging
-    ├── camera.py              # Camera setup from calibration extrinsics/intrinsics
-    ├── capture.py             # Viewport video capture + side-by-side comparison pipeline
-    ├── viewport.py            # Shared omni.kit.viewport.utility import helper
-    ├── object.py              # Object spawning, pose updates, D6 tracking joints, collision filtering
-    └── generate_lula_description.py  # One-time utility to generate Lula YAML from URDF
+    ├── __init__.py
+    │
+    ├── app.py                    # SimulationApp + shared argparse (--headless, --fps)
+    ├── capture.py                # Viewport video capture / side-by-side / overlay
+    ├── constants.py              # Shared constants (paths, joints, Aria K/extrinsic, FPS dict)
+    ├── rotation.py               # Quaternion math (pure numpy)
+    ├── ik.py                     # IK solver creation + per-frame position setter
+    ├── object.py                 # Object spawning + per-frame pose updates
+    ├── poses.py                  # 6D pose trajectory loader
+    ├── robot.py                  # Articulation setup + home pose
+    ├── viewport.py               # omni.kit.viewport.utility wrapper
+    ├── textures.py               # USD material/texture helpers
+    ├── generate_lula_description.py
+    │
+    ├── config.py                 # BASE: TableConfig, RobotMountConfig,
+    │                             #       BaseCameraConfig, BaseSceneConfig, select_config()
+    ├── config_maple.py           # WallsConfig, AprilTagConfig, OakDCameraConfig, MapleSceneConfig
+    ├── config_egoverse.py        # AriaCameraConfig, EgoverseSceneConfig
+    │
+    ├── scene.py                  # Shared builder; reads cfg.has_walls() / cfg.has_apriltag()
+    ├── camera.py                 # Shared USD-camera prim writer (pose comes from caller)
+    │
+    ├── apriltag.py               # MAPLE-ONLY USD tag plane builder
+    ├── calibrate_april.py        # MAPLE-ONLY: AprilTag detect + PnP → T_world_cam
+    ├── calibrate_table.py        # EGOVERSE-ONLY: SAM table-edge refinement → T_world_cam
+    │
+    └── h5_loader.py              # Dataset-keyed schema: H5Schema, H5Reader(dataset=...)
 ```
 
-### Scripts
+**File naming rule:** `*_maple.py` / `*_egoverse.py` suffixes mark
+dataset-specific modules. Files without a suffix are shared. `apriltag.py`,
+`calibrate_april.py`, `calibrate_table.py` don't carry suffixes because the
+name itself is already rig-specific.
 
-| Script | Description |
-| --- | --- |
-| `test_setup.py` | Loads a USD scene, computes IK home arm joints, optionally spawns an object, sets the home pose, and holds it. Defaults to `--mode single --object duck`. Supports `--camera` to preview calibrated viewpoints and `--object`/`--position`/`--scale` for object spawning. Runs until the window is closed. Use this to verify the scene and home pose look correct before running replay. |
-| `kinematic_replay.py` | Kinematic replay. Defaults to `--mode single --camera aria --object duck`. Loads H5 wrist pose + hand joint data, solves IK per frame, and replays the trajectory in Isaac Sim. The object is spawned as a kinematic rigid body that follows the 6D pose trajectory exactly (no physics). Supports `--record-sim` for video, `--record-comparison` for side-by-side. See `docs/kinematic_replay.html` for detailed documentation. |
-| `dynamic_replay.py` | Dynamic replay. Same defaults as kinematic replay (`--mode single --camera aria --object duck`). The object is a dynamic rigid body that follows physics (gravity, collisions). A kinematic anchor follows the trajectory, and a D6 joint with spring-damper drives pulls the object toward it. Tune with `--stiffness` (default 500), `--damping` (default 100), and `--object-mass` (default 0.1 kg). See `docs/dynamic_replay_strategy.html` for design rationale. |
-| `record_h5.py` | Standalone script to extract original camera images from H5 files to MP4. No Isaac Sim or GPU required. Supports `--h5-camera` (`aria`, `oakd`), `--mode`, `--fps`, `--h5-path`. |
-| `calculate_table_depth.py` | Computes camera-to-table-corner depths analytically using calibration data. No Isaac Sim required. |
+**Config dispatch rule:** shared modules consume `BaseSceneConfig` and branch
+on `cfg.has_walls()` / `cfg.has_apriltag()` / `cfg.viewport_size()`. No
+`isinstance(cfg, MapleSceneConfig)` in shared code.
 
-### Utility Modules (`scripts/utils/`)
+---
 
-| Module | Isaac Sim deps? | Description |
-| --- | --- | --- |
-| `constants.py` | No | Central source of truth for all constants: prim paths, joint names, DOF counts, file paths (USD, URDF, H5, objects), home poses, IK configuration, camera calibration (Aria extrinsics/intrinsics), object pose trajectory paths, and per-arm configuration (`ARM_CONFIGS`). All paths are anchored to `PROJECT_ROOT`. |
-| `app.py` | Minimal | `add_common_args(parser)` adds `--headless`, `--fps`, `--mode` to any argparse parser. `create_app(args)` creates the SimulationApp. `resolve_usd_path(mode)` / `resolve_h5_path(mode)` map mode to file paths. |
-| `robot.py` | Yes (deferred) | `setup_articulation()` creates a robot from a USD prim. `resolve_dof_indices()` maps joint names to DOF indices with alias (`panda_joint` ↔ `fer_joint`) and suffix fallback. `print_dof_info()` prints DOF names for debugging. `add_articulations(world, mode)` registers one or two robot articulations based on mode. `setup_arms_ik(arms)` creates IK solvers, resolves DOFs, sets home poses, and builds per-frame position setter closures for each arm. |
-| `rotation.py` | No | Pure quaternion math: `rotation_matrix_to_wxyz()`, `wxyz_to_rotation_matrix()`, `quat_multiply()`, `tool_quat_to_urdf()` (H5 tool-frame → URDF convention via Rx(180°)), `detect_quaternion_order()` (auto-detect wxyz vs xyzw). |
-| `ik.py` | Yes (deferred) | `create_ik_solver()` builds a Lula IK solver from URDF + descriptor. `solve_ik_for_pose()` solves IK for a target pose. `make_ik_position_setter()` returns a per-frame closure with warm-start tracking and EE wrist offset support. |
-| `h5_loader.py` | No | `load_h5()` loads arm wrist poses and hand joint angles from HDF5 files. Supports both `observations/qpos_*` and `actions_*` key schemas, single and dual arm modes. Also provides `get_available_cameras()`, `get_h5_image_dims()`, and `open_h5_images()` for H5 image data access. |
-| `poses.py` | No | `load_pose_trajectory()` loads (N, 4, 4) transforms from `.npz`. `transform_trajectory()` re-expresses trajectories in a different frame. `translation_matrix()` and `average_poses()` are shared pure-numpy utilities used by camera.py and calculate_table_depth.py. |
-| `camera.py` | Yes (deferred) | Camera setup from real-world calibration. `compute_camera_world_pose()` computes camera world pose from extrinsics + robot base transforms. `create_camera_prim()` creates a USD camera with intrinsics. `set_viewport_camera()` sets the active viewport. Supports Aria Gen 1 (extensible to OAK-D). |
-| `capture.py` | Yes (deferred) | Video capture pipeline: `setup_recording(args, h5_path, n_frames, video_suffix, ...)` is the high-level entry point that wires up recording from CLI flags. Underlying primitives: `setup_capture()` / `capture_frame_to_writer()` / `close_recorder()` for sim viewport recording (with deferred encoding for speed; supports memory-only mode when `output_path=None`), and `setup_sidebyside()` / `capture_sidebyside_frame()` / `close_sidebyside()` for side-by-side comparison videos. |
-| `viewport.py` | Yes (deferred) | Shared `get_viewport_utility()` helper that imports and returns `omni.kit.viewport.utility`, auto-enabling the extension if needed. Used by camera.py and capture.py. |
-| `object.py` | Yes (deferred) | `load_object_world_trajectory()` is the high-level entry point: resolves the .npz path, loads the camera-frame trajectory, transforms it to world frame, and warns on frame-count mismatch. `resolve_object_pose_path()` maps an object name to its .npz pose file. `spawn_object()` loads an OBJ mesh into the scene with rigid body physics (supports kinematic mode for trajectory replay). `set_object_world_pose()` updates pose from a 4x4 transform via `XformCommonAPI`. `create_d6_tracking_joint()` creates a kinematic anchor + D6 joint with spring-damper drives for dynamic replay. `filter_collision_pair()` disables collision between two prims. |
+## Data layout
 
-**Import ordering note:** Modules marked "Yes (deferred)" import Isaac Sim types and must be imported by scripts *after* `create_app()` returns. Modules marked "No" are safe to import at any time.
+H5 stems are recording timestamps (`YYYYMMDD_HHMMSS`). Object-pose and SAM-mask
+files are keyed to the H5 stem they belong to. Current contents:
 
-### Docs
+```text
+data/
+├── maple/                                   # OakD recordings, 10 Hz
+│   ├── h5/
+│   ├── pose/
+│   └── video/
+└── egoverse/                                # Aria recordings, 50 Hz
+    ├── h5/
+    ├── pose/
+    ├── desk/
+    └── video/
+```
 
-Docs have been generated with the help of Claude to explain how things are done and brainstorm ideas. Look at them as reference to better understand how everything works. They may be incomplete or slightly out of date. Feel free to add your own documentations. 
+Object meshes (rig-independent):
+
+```text
+objects/
+├── duck/
+└── pan/
+```

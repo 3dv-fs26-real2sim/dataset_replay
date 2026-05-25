@@ -7,10 +7,11 @@ has been instantiated.
 """
 
 from .config import (
-    SceneConfig,
-    TableConfig,
+    BaseCameraConfig,
+    BaseSceneConfig,
     RobotMountConfig,
-    CameraConfig,
+    TableConfig,
+    select_config,
 )
 from .constants import (
     ROBOT_PRIM_PATH,

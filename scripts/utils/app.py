@@ -10,22 +10,23 @@ from isaacsim import SimulationApp
 from .constants import H5_DEFAULT_FPS
 
 
-def add_common_args(parser: argparse.ArgumentParser) -> None:
+def add_common_args(parser: argparse.ArgumentParser, *, dataset: str) -> None:
     """Add ``--headless`` and ``--fps`` arguments shared by all scripts.
 
     The ``--fps`` value drives the **output video frame rate** used by
     capture.py (sim viewport, side-by-side, overlay MP4s). For the
     sim/H5 overlays to stay in sync with the source recording, this
-    must match the H5 capture rate — see ``constants.H5_DEFAULT_FPS``.
-    The kinematic replay loop teleports joints once per H5 frame, so
-    the underlying Isaac Sim physics_dt is independent and does not
-    need to be retimed.
+    must match the H5 capture rate — see ``constants.H5_DEFAULT_FPS``
+    for the per-rig defaults. The kinematic replay loop teleports
+    joints once per H5 frame, so the underlying Isaac Sim physics_dt is
+    independent and does not need to be retimed.
     """
+    default_fps = H5_DEFAULT_FPS[dataset]
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     parser.add_argument(
-        "--fps", type=float, default=H5_DEFAULT_FPS,
-        help=f"Output video frame rate (default: {H5_DEFAULT_FPS}, "
-             f"matching H5_DEFAULT_FPS in utils/constants.py)",
+        "--fps", type=float, default=default_fps,
+        help=f"Output video frame rate (default: {default_fps} Hz, "
+             f"matching {dataset!r} H5 capture rate in utils/constants.py)",
     )
 
 

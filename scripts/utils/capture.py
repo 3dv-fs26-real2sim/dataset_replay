@@ -21,6 +21,8 @@ def setup_recording(
     video_suffix: str,
     app_width: int,
     app_height: int,
+    *,
+    dataset: str,
 ):
     """Configure video recorders based on CLI flags.
 
@@ -39,6 +41,8 @@ def setup_recording(
             (e.g. ``"qpos_duck"``).
         app_width: Render width in pixels.
         app_height: Render height in pixels.
+        dataset: ``"maple"`` or ``"egoverse"`` — picks the right H5 image-key
+            template when opening the file for side-by-side / overlay.
 
     Returns:
         ``(recorder, sim_output_path, sbs_recorder, sbs_output_path, overlay_recorders)``
@@ -70,6 +74,7 @@ def setup_recording(
         sbs_recorder, sbs_output_path = setup_sidebyside(
             n_frames, OUTPUT_DIR / sbs_name,
             args.fps, app_width, app_height, h5_path, args.h5_camera,
+            dataset=dataset,
         )
 
     overlay_recorders = []
@@ -78,6 +83,7 @@ def setup_recording(
         ov_recorder, _ = setup_overlay(
             n_frames, OUTPUT_DIR / ov_name,
             args.fps, app_width, app_height, h5_path, args.h5_camera, alpha,
+            dataset=dataset,
         )
         if ov_recorder is not None:
             overlay_recorders.append(ov_recorder)
@@ -255,7 +261,8 @@ def close_recorder(recorder) -> None:
 # ── Side-by-side (comparison) capture ────────────────────────────────────────
 
 
-def setup_sidebyside(total_frames, output_path, fps, sim_width, sim_height, h5_path, h5_camera):
+def setup_sidebyside(total_frames, output_path, fps, sim_width, sim_height,
+                     h5_path, h5_camera, *, dataset: str):
     """Set up side-by-side capture: Isaac Sim viewport (left) + H5 original (right).
 
     Returns:
@@ -263,7 +270,7 @@ def setup_sidebyside(total_frames, output_path, fps, sim_width, sim_height, h5_p
     """
     from .h5_loader import open_h5_images
 
-    h5_file, h5_dataset = open_h5_images(h5_path, h5_camera)
+    h5_file, h5_dataset = open_h5_images(h5_path, dataset=dataset, camera=h5_camera)
     if h5_file is None:
         print(f"[sidebyside] Cannot set up comparison: camera '{h5_camera}' not in {h5_path}")
         return None, None
@@ -339,6 +346,7 @@ def close_sidebyside(recorder) -> None:
 def setup_overlay(
     total_frames, output_path, fps,
     sim_width, sim_height, h5_path, h5_camera, alpha: float,
+    *, dataset: str,
 ):
     """Set up overlay capture: alpha-blend Isaac Sim viewport with H5 frame.
 
@@ -351,7 +359,7 @@ def setup_overlay(
     """
     from .h5_loader import open_h5_images
 
-    h5_file, h5_dataset = open_h5_images(h5_path, h5_camera)
+    h5_file, h5_dataset = open_h5_images(h5_path, dataset=dataset, camera=h5_camera)
     if h5_file is None:
         print(f"[overlay] Cannot set up overlay: camera '{h5_camera}' not in {h5_path}")
         return None, None

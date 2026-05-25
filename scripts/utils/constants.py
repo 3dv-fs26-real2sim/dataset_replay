@@ -24,16 +24,19 @@ OUTPUT_DIR   = PROJECT_ROOT / "outputs"
 
 
 # ── Capture rate ──────────────────────────────────────────────────────────────
-# Frame rate at which the egoverse H5 datasets are recorded. All replay /
-# capture scripts default to this so MP4 outputs play back at the same
-# speed as the source recording. Override via the shared ``--fps`` CLI
-# flag (added by ``utils.app.add_common_args``) if you point a script at
-# an H5 captured at a different rate.
+# Frame rate at which each rig's H5 datasets are recorded. All replay /
+# capture scripts default to the right per-rig value so MP4 outputs play
+# back at the same speed as the source recording. Override via the shared
+# ``--fps`` CLI flag (added by ``utils.app.add_common_args``) if you point
+# a script at an H5 captured at a different rate.
 #
 # When ``--sample-every N`` is also passed, the writer's effective fps is
-# ``H5_DEFAULT_FPS / N``: e.g. ``--sample-every 5`` on 50 Hz data gives
-# a 10 Hz output video (recording every fifth simulated frame).
-H5_DEFAULT_FPS = 50.0   # Hz — H5 capture / MP4 output frame rate.
+# ``H5_DEFAULT_FPS[dataset] / N``: e.g. ``--sample-every 5`` on 50 Hz data
+# gives a 10 Hz output video (recording every fifth simulated frame).
+H5_DEFAULT_FPS = {
+    "maple":    10.0,   # OakD recordings
+    "egoverse": 50.0,   # Aria recordings
+}
 
 
 # ── Prim paths ────────────────────────────────────────────────────────────────

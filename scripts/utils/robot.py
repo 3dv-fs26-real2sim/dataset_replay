@@ -8,7 +8,7 @@ import numpy as np
 from isaacsim.core.api import World
 from isaacsim.core.prims import SingleArticulation
 
-from .config import SceneConfig
+from .config import BaseSceneConfig
 from .constants import (
     ARM_JOINT_NAMES, EE_FRAME_NAME, EE_WRIST_OFFSET_IN_LINK8,
     HAND_HOME_JOINT_VALUES, HAND_JOINT_NAMES, ROBOT_PRIM_PATH,
@@ -18,7 +18,7 @@ from .ik import create_ik_solver, make_ik_position_setter, solve_ik_for_pose
 from .rotation import rotation_matrix_to_wxyz
 
 
-def setup_robot(world: World, cfg: SceneConfig) -> dict:
+def setup_robot(world: World, cfg: BaseSceneConfig) -> dict:
     """Add the right-arm articulation to the world, resolve DOFs, set the
     home pose via IK, and build a per-frame position setter.
 

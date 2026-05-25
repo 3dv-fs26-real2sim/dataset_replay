@@ -1,30 +1,22 @@
-"""H5 trajectory loading — egoverse single-arm Aria adapter.
+"""H5 trajectory loading — single-arm adapter for both Maple and Egoverse.
 
-The egoverse H5 schema is single-arm, generic-named (no ``_right`` suffix):
+Schema dispatched on the ``dataset`` keyword:
 
-    observations/qpos_arm           (N, 7)  float64  — [x,y,z, qw,qx,qy,qz]
-    observations/qpos_hand          (N, 17) float64
-    observations/images/aria_rgb_cam/color  (N, 480, 640, 3) uint8
-    actions_arm                     (N, 7)  float64  (top level; optional)
-    actions_hand                    (N, 17) float64  (top level; optional)
-
-Pass ``use_actions=True`` to ``H5Reader`` (or ``--use-actions`` on the
-replay scripts) to drive replay from the top-level ``actions_*`` arrays
-instead of the observation qpos arrays.
-
-Unlike maple's OakD recordings, egoverse H5s do **not** carry per-frame
-camera intrinsics or extrinsics: the Aria intrinsics are static (stored
-in ``utils.constants.ARIA_INTRINSICS``) and the extrinsic is computed at
-runtime from the right-arm base via
-``utils.calibrate_table.compute_nominal_aria_pose`` — optionally refined
-on the fly by ``utils.calibrate_table.refine_aria_extrinsic`` from a SAM
-table mask under ``data/egoverse/desk/``.
+  * **maple**: per-frame arm key ``observations/qpos_arm_right``, hand
+    ``observations/qpos_hand_right``, OakD images under
+    ``observations/images/oakd_front_view/color``, per-frame ``intrinsics``
+    and ``extrinsics`` arrays alongside. No top-level ``actions_*``.
+  * **egoverse**: per-frame arm key ``observations/qpos_arm``, hand
+    ``observations/qpos_hand``, Aria images under
+    ``observations/images/aria_rgb_cam/color``. Top-level ``actions_arm`` /
+    ``actions_hand`` available for action-driven replay.
 
 Only depends on h5py and numpy — no Isaac Sim imports.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -34,14 +26,51 @@ import numpy as np
 from .constants import N_ARM_POSE_DIMS, N_HAND_DOFS
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class H5Schema:
+    """Per-dataset H5 layout description."""
+    default_camera:    str
+    arm_key:           str
+    hand_key:          str
+    image_key_fmt:     str
+    depth_key_fmt:     str
+    has_actions:       bool
+    action_arm_key:    str | None = None
+    action_hand_key:   str | None = None
+
+
+SCHEMA: dict[str, H5Schema] = {
+    "maple": H5Schema(
+        default_camera="oakd_front_view",
+        arm_key="observations/qpos_arm_right",
+        hand_key="observations/qpos_hand_right",
+        image_key_fmt="observations/images/{camera}/color",
+        depth_key_fmt="observations/images/{camera}/depth",
+        has_actions=False,
+    ),
+    "egoverse": H5Schema(
+        default_camera="aria_rgb_cam",
+        arm_key="observations/qpos_arm",
+        hand_key="observations/qpos_hand",
+        image_key_fmt="observations/images/{camera}/color",
+        depth_key_fmt="observations/images/{camera}/depth",
+        has_actions=True,
+        action_arm_key="actions_arm",
+        action_hand_key="actions_hand",
+    ),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class H5Reader:
     """Adapter between an H5 file and the kinematic replay loop.
 
     Usage::
 
-        with H5Reader(path) as h5:                          # use qpos
+        with H5Reader(path, dataset="maple") as h5:
             traj = h5.load_trajectories()
-        with H5Reader(path, use_actions=True) as h5:        # use actions_*
+        with H5Reader(path, dataset="egoverse", use_actions=True) as h5:
             traj = h5.load_trajectories()
 
         for i in range(traj["n_frames"]):
@@ -50,30 +79,42 @@ class H5Reader:
             rgb_frame = h5.image(i)               # (H, W, 3) uint8
     """
 
-    # ── Schema constants ────────────────────────────────────────────────────
-    DEFAULT_CAMERA = "aria_rgb_cam"
-    OBS_ARM_KEY     = "observations/qpos_arm"   # (N, 7)  [x y z qw qx qy qz]
-    OBS_HAND_KEY    = "observations/qpos_hand"  # (N, 17)
-    ACTION_ARM_KEY  = "actions_arm"             # (N, 7)  top-level
-    ACTION_HAND_KEY = "actions_hand"            # (N, 17) top-level
-    IMAGE_KEY_FMT   = "observations/images/{camera}/color"   # (N, H, W, 3) uint8
-    DEPTH_KEY_FMT   = "observations/images/{camera}/depth"   # (N, H, W) float32
-
-    # ── Construction ───────────────────────────────────────────────────────
-    def __init__(self, h5_path: str | Path, camera: str = DEFAULT_CAMERA,
-                 *, use_actions: bool = False):
-        self._path = Path(h5_path)
-        self._camera = camera
+    def __init__(
+        self,
+        h5_path: str | Path,
+        *,
+        dataset: str,
+        camera: str | None = None,
+        use_actions: bool = False,
+    ):
+        if dataset not in SCHEMA:
+            raise ValueError(
+                f"unknown dataset {dataset!r}; expected one of {list(SCHEMA)}"
+            )
+        self.schema   = SCHEMA[dataset]
+        self._dataset = dataset
+        self._path    = Path(h5_path)
+        self._camera  = camera or self.schema.default_camera
         self._use_actions = bool(use_actions)
+        if use_actions and not self.schema.has_actions:
+            raise ValueError(
+                f"{dataset!r} H5s do not store top-level actions_*; "
+                f"use_actions=True is unsupported."
+            )
         self._f: h5py.File | None = h5py.File(self._path, "r")
 
+    # ── Resolved keys ──────────────────────────────────────────────────────
     @property
     def arm_key(self) -> str:
-        return self.ACTION_ARM_KEY if self._use_actions else self.OBS_ARM_KEY
+        if self._use_actions:
+            return self.schema.action_arm_key  # type: ignore[return-value]
+        return self.schema.arm_key
 
     @property
     def hand_key(self) -> str:
-        return self.ACTION_HAND_KEY if self._use_actions else self.OBS_HAND_KEY
+        if self._use_actions:
+            return self.schema.action_hand_key  # type: ignore[return-value]
+        return self.schema.hand_key
 
     @property
     def n_frames(self) -> int:
@@ -82,6 +123,10 @@ class H5Reader:
     @property
     def camera(self) -> str:
         return self._camera
+
+    @property
+    def dataset(self) -> str:
+        return self._dataset
 
     # ── Trajectory access ──────────────────────────────────────────────────
     def load_trajectories(self) -> dict:
@@ -127,7 +172,7 @@ class H5Reader:
     # ── Image access ───────────────────────────────────────────────────────
     def image(self, frame_idx: int) -> np.ndarray:
         """Return RGB image for one frame, ``(H, W, 3)`` uint8."""
-        key = self.IMAGE_KEY_FMT.format(camera=self._camera)
+        key = self.schema.image_key_fmt.format(camera=self._camera)
         return self._f[key][frame_idx]
 
     def image_dataset(self):
@@ -136,17 +181,17 @@ class H5Reader:
         The capture pipeline (``utils.capture``) prefers this over per-frame
         ``image()`` calls when overlaying live sim onto recorded H5 frames.
         """
-        key = self.IMAGE_KEY_FMT.format(camera=self._camera)
+        key = self.schema.image_key_fmt.format(camera=self._camera)
         return self._f[key] if key in self._f else None
 
     def depth(self, frame_idx: int) -> Optional[np.ndarray]:
         """Return depth image for one frame if present, else ``None``."""
-        key = self.DEPTH_KEY_FMT.format(camera=self._camera)
+        key = self.schema.depth_key_fmt.format(camera=self._camera)
         return self._f[key][frame_idx] if key in self._f else None
 
     def image_dims(self) -> tuple[int, int] | tuple[None, None]:
         """Return ``(width, height)`` of the camera images, or (None, None)."""
-        key = self.IMAGE_KEY_FMT.format(camera=self._camera)
+        key = self.schema.image_key_fmt.format(camera=self._camera)
         if key not in self._f:
             return (None, None)
         shape = self._f[key].shape  # (N, H, W, C)
@@ -165,25 +210,93 @@ class H5Reader:
         self.close()
 
 
-# ── Stand-alone helpers ──────────────────────────────────────────────────────
-def open_h5_images(path: str | Path, camera: str = H5Reader.DEFAULT_CAMERA):
+# ─────────────────────────────────────────────────────────────────────────────
+# Stand-alone helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def open_h5_images(
+    path: str | Path,
+    *,
+    dataset: str,
+    camera: str | None = None,
+):
     """Backwards-compat helper for ``utils/capture.py``.
 
     Returns ``(h5py.File, h5py.Dataset)`` for random-access frame reads, or
     ``(None, None)`` if the camera dataset isn't present. The caller is
     responsible for closing the returned ``h5py.File``.
     """
+    if dataset not in SCHEMA:
+        raise ValueError(
+            f"unknown dataset {dataset!r}; expected one of {list(SCHEMA)}"
+        )
+    schema = SCHEMA[dataset]
+    cam = camera or schema.default_camera
     f = h5py.File(path, "r")
-    key = H5Reader.IMAGE_KEY_FMT.format(camera=camera)
+    key = schema.image_key_fmt.format(camera=cam)
     if key not in f:
         f.close()
         return None, None
     return f, f[key]
 
 
+def read_h5_intrinsic(
+    path: str | Path,
+    *,
+    camera: str,
+) -> np.ndarray:
+    """Return the 3×3 camera intrinsic matrix stored in an H5, or raise.
+
+    Looks under ``observations/images/{camera}/intrinsics`` (shape (9,)).
+    Maple records this; egoverse does not. Egoverse intrinsics are static
+    and live in :data:`utils.constants.ARIA_INTRINSICS`.
+    """
+    key = f"observations/images/{camera}/intrinsics"
+    with h5py.File(path, "r") as f:
+        if key not in f:
+            raise KeyError(f"H5 file lacks {key!r}")
+        return np.array(f[key]).reshape(3, 3).astype(float)
+
+
+def read_h5_extrinsic(
+    path: str | Path,
+    *,
+    camera: str,
+    mount_xyz: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+    mount_rpy: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Return the camera's 4×4 T_world_cam given the recorded T_robot_cam.
+
+    The H5 stores ``observations/images/{camera}/extrinsics`` (shape (16,))
+    as a flattened row-major 4×4 ``T_robot_cam`` — the camera's pose in the
+    panda_link0 frame. To convert to world frame we compose with
+    ``T_world_robot``::
+
+        T_world_cam = T_world_robot @ T_robot_cam
+
+    Both ``mount_xyz`` and ``mount_rpy`` should match
+    ``cfg.robot.mount_xyz`` / ``mount_rpy`` for the converted pose to align
+    with the simulated robot.
+
+    Maple-only — egoverse H5s do not record per-frame extrinsics.
+    """
+    key = f"observations/images/{camera}/extrinsics"
+    with h5py.File(path, "r") as f:
+        if key not in f:
+            raise KeyError(f"H5 file lacks {key!r}")
+        T_robot_cam = np.array(f[key]).reshape(4, 4).astype(float)
+
+    T_world_robot = np.eye(4)
+    T_world_robot[:3, 3] = np.asarray(mount_xyz, dtype=float)
+    if any(r != 0.0 for r in mount_rpy):
+        from scipy.spatial.transform import Rotation
+        T_world_robot[:3, :3] = Rotation.from_euler("XYZ", mount_rpy).as_matrix()
+
+    return T_world_robot @ T_robot_cam
+
+
 def peek_schema(path: str | Path, max_depth: int = 4) -> None:
     """Print the dataset hierarchy of an H5 file. Useful for adapting
-    :class:`H5Reader`'s schema constants to a new dataset format.
+    :class:`H5Schema` constants to a new dataset format.
     """
     path = Path(path)
     print(f"=== {path} ===")
