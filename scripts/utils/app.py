@@ -4,51 +4,37 @@ Only imports ``isaacsim.SimulationApp`` — safe as a top-level import.
 """
 
 import argparse
-from pathlib import Path
 
 from isaacsim import SimulationApp
 
-from .constants import USD_PATH_SINGLE, USD_PATH_DUAL, H5_PATH_SINGLE, H5_PATH_DUAL
+from .constants import H5_DEFAULT_FPS
 
 
-def add_common_args(parser: argparse.ArgumentParser) -> None:
-    """Add --headless, --fps, and --mode arguments shared by all scripts."""
+def add_common_args(parser: argparse.ArgumentParser, *, dataset: str) -> None:
+    """Add ``--headless`` and ``--fps`` arguments shared by all scripts.
+
+    The ``--fps`` value drives the **output video frame rate** used by
+    capture.py (sim viewport, side-by-side, overlay MP4s). For the
+    sim/H5 overlays to stay in sync with the source recording, this
+    must match the H5 capture rate — see ``constants.H5_DEFAULT_FPS``
+    for the per-rig defaults. The kinematic replay loop teleports
+    joints once per H5 frame, so the underlying Isaac Sim physics_dt is
+    independent and does not need to be retimed.
+    """
+    default_fps = H5_DEFAULT_FPS[dataset]
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
-    parser.add_argument("--fps", type=float, default=50.0, help="Simulation frame rate (default: 50.0)")
     parser.add_argument(
-        "--mode",
-        type=str,
-        default="dual",
-        choices=["single", "dual"],
-        help="Choose between single arm (right) or dual arm setup (default: dual)",
+        "--fps", type=float, default=default_fps,
+        help=f"Output video frame rate (default: {default_fps} Hz, "
+             f"matching {dataset!r} H5 capture rate in utils/constants.py)",
     )
 
 
 def create_app(args, width: int = 1280, height: int = 720) -> SimulationApp:
     """Create the Isaac Sim application with standard renderer config."""
-    return SimulationApp(
-        {
-            "headless": args.headless,
-            "renderer": "RayTracedLighting",
-            "width": width,
-            "height": height,
-        }
-    )
-
-
-def resolve_usd_path(mode: str) -> Path:
-    """Return the USD scene path for the given mode ('single' or 'dual')."""
-    if mode == "single":
-        return USD_PATH_SINGLE
-    elif mode == "dual":
-        return USD_PATH_DUAL
-    raise ValueError(f"Invalid mode: {mode}")
-
-
-def resolve_h5_path(mode: str) -> Path:
-    """Return the default H5 data path for the given mode."""
-    if mode == "single":
-        return H5_PATH_SINGLE
-    elif mode == "dual":
-        return H5_PATH_DUAL
-    raise ValueError(f"Invalid mode: {mode}")
+    return SimulationApp({
+        "headless":  args.headless,
+        "renderer":  "RayTracedLighting",
+        "width":     width,
+        "height":    height,
+    })

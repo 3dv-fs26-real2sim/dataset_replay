@@ -1,109 +1,71 @@
-"""Camera setup for Isaac Sim viewport from real-world calibration data.
+"""USD camera placement (Isaac Sim side of the Aria-camera stack).
 
-Positions the viewport camera to match a calibrated real-world camera
-(e.g., Aria glasses) using extrinsic transforms relative to robot arm bases.
+This module is intentionally narrow: it takes a 4×4 ``T_world_cam`` (computed
+by the caller — typically :mod:`utils.calibrate_table`) and configures a
+``UsdGeom.Camera`` prim with pinhole intrinsics from ``BaseCameraConfig``. The
+caller decides whether that pose is the nominal base-relative one or a
+SAM-refined one; this module doesn't read the stage to derive it, keeping
+the pose used here in lock-step with the pose downstream consumers
+(object-trajectory composition, diagnostics) see.
 
-Depends on Isaac Sim / pxr (deferred import).
-Must be imported after SimulationApp is created.
+Depends on ``pxr`` and ``omni.usd`` — must be imported after SimulationApp
+is created.
 """
 
-import numpy as np
+from __future__ import annotations
 
+import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
-from .constants import CAMERA_CONFIGS
-from .poses import average_poses
+from .config import BaseCameraConfig
 
 # CV cameras look along +Z; USD cameras look along -Z (OpenGL convention).
-# Rotate 180° around X to convert between the two.
+# Diag(1, -1, -1, 1) flips Y and Z to convert between the two.
 _T_USD_FROM_CV = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
+def setup_camera(stage: Usd.Stage, cfg: BaseCameraConfig,
+                 *, prim_path: str | None = None,
+                 world_pose_override: np.ndarray) -> str:
+    """Create a UsdGeom.Camera at ``world_pose_override`` and make it the
+    active viewport camera. Returns the camera prim path.
 
+    The caller computes the pose — either via
+    :func:`utils.calibrate_table.compute_nominal_aria_pose` (cheap, pure
+    math) or :func:`utils.calibrate_table.refine_aria_extrinsic` (SAM-
+    based refinement). This module deliberately doesn't reach into the
+    stage to derive it, so the camera doesn't get out of sync with what
+    other code (object trajectory composition, diagnostics) sees.
 
-def setup_camera(stage, camera_name, mode, left_prim_path, right_prim_path):
-    """Create a calibrated camera and set it as the active viewport camera.
-
-    Args:
-        stage: USD stage.
-        camera_name: Key into CAMERA_CONFIGS (e.g. "aria").
-        mode: "single" or "dual".
-        left_prim_path: Prim path of the left robot arm (ignored in single mode).
-        right_prim_path: Prim path of the right robot arm.
-
-    Returns:
-        The USD prim path of the created camera (e.g. "/World/AriaCamera").
+    The rendered FOV comes from ``cfg.intrinsics`` (the doc K). PnP uses
+    the same K, so the sim viewport matches the recorded video.
     """
-    config = CAMERA_CONFIGS[camera_name]
-    extrinsics = config["extrinsics"]
-    intrinsics = config["intrinsics"]
+    _check_intrinsics(cfg.intrinsics)
 
-    left_path = left_prim_path if mode == "dual" else None
-    world_pose = compute_camera_world_pose(stage, extrinsics, left_path, right_prim_path)
+    world_pose = np.asarray(world_pose_override, dtype=float)
+    if world_pose.shape != (4, 4):
+        raise ValueError(
+            f"world_pose_override must be 4×4, got {world_pose.shape}"
+        )
+    pos = world_pose[:3, 3]
+    print(f"[camera] {cfg.name}: world position "
+          f"[{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
 
-    prim_path = f"/World/{camera_name.capitalize()}Camera"
-    create_camera_prim(stage, prim_path, world_pose, intrinsics)
+    prim_path = prim_path or f"/World/Cameras/{_camel(cfg.name)}"
+    UsdGeom.Xform.Define(stage, "/World/Cameras")
+    create_camera_prim(stage, prim_path, world_pose, cfg)
     set_viewport_camera(prim_path)
     return prim_path
 
 
-def compute_camera_world_pose(stage, extrinsics, left_prim_path, right_prim_path):
-    """Compute the camera world pose by transforming through robot base poses.
-
-    In dual mode both arm bases are used and the results averaged.
-    In single mode (left_prim_path is None) only the right arm is used.
-
-    Returns:
-        4x4 homogeneous matrix — camera pose in world frame.
-    """
-    poses = []
-
-    # Right arm (always available).
-    T_world_base_r = get_prim_world_transform(stage, right_prim_path)
-    T_world_cam_r = T_world_base_r @ extrinsics["right"]
-    poses.append(T_world_cam_r)
-
-    # Left arm (dual mode only).
-    if left_prim_path is not None:
-        T_world_base_l = get_prim_world_transform(stage, left_prim_path)
-        T_world_cam_l = T_world_base_l @ extrinsics["left"]
-        poses.append(T_world_cam_l)
-
-    if len(poses) == 1:
-        result = poses[0]
-    else:
-        result = average_poses(poses)
-
-    pos = result[:3, 3]
-    print(f"[camera] Camera world position: [{pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}]")
-    return result
-
-
-def get_prim_world_transform(stage, prim_path):
-    """Get the 4x4 column-vector-convention world transform of a USD prim.
-
-    USD's Gf.Matrix4d uses row-vector convention (p' = p * M).
-    We transpose to standard column-vector convention (p' = M * p).
-    """
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim.IsValid():
-        raise RuntimeError(f"Prim not found: {prim_path}")
-
-    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    gf_mat = xform_cache.GetLocalToWorldTransform(prim)
-    # Gf.Matrix4d → numpy.  GetArray() returns row-major; transpose for column-vector.
-    return np.array(gf_mat, dtype=float).T
-
-
-def create_camera_prim(stage, prim_path, world_pose, intrinsics):
+def create_camera_prim(stage: Usd.Stage, prim_path: str,
+                       world_pose: np.ndarray, cfg: BaseCameraConfig) -> str:
     """Create a UsdGeom.Camera with the given world pose and pinhole intrinsics.
 
-    Args:
-        stage: USD stage.
-        prim_path: Where to define the camera (e.g. "/World/AriaCamera").
-        world_pose: 4x4 column-vector-convention transform (camera-in-world).
-        intrinsics: dict with keys width, height, fx, fy, cx, cy.
+    The world pose is in OpenCV camera convention (+Z forward); a CV→USD
+    rotation flip is applied so the resulting USD camera looks at the same
+    target as the input pose suggests.
     """
     camera = UsdGeom.Camera.Define(stage, prim_path)
 
@@ -115,37 +77,32 @@ def create_camera_prim(stage, prim_path, world_pose, intrinsics):
     xformable.ClearXformOpOrder()
     xformable.AddTransformOp().Set(gf_mat)
 
-    # Map pinhole intrinsics to USD camera attributes.
-    # USD uses focalLength (mm) and aperture (mm).  We pick an arbitrary
-    # focal-length value and derive the aperture so that the projection
-    # matches the pinhole model.
-    #! Are we sure this is done correctly? Double-check. 
-    focal_length_mm = 24.0  # arbitrary — only the ratio matters
-    h_aperture = focal_length_mm * intrinsics["width"]  / intrinsics["fx"]
-    v_aperture = focal_length_mm * intrinsics["height"] / intrinsics["fy"]
+    # Map pinhole intrinsics → USD camera attributes.
+    K = cfg.intrinsics
+    focal_length_mm = 24.0   # arbitrary — only the ratio aperture/focal matters
+    h_aperture = focal_length_mm * cfg.width  / K["fx"]
+    v_aperture = focal_length_mm * cfg.height / K["fy"]
 
     camera.GetFocalLengthAttr().Set(focal_length_mm)
     camera.GetHorizontalApertureAttr().Set(h_aperture)
     camera.GetVerticalApertureAttr().Set(v_aperture)
 
-    # Principal point offset (0 = centered).
-    cx_offset = (intrinsics["cx"] - intrinsics["width"]  / 2.0) / intrinsics["fx"] * focal_length_mm
-    cy_offset = (intrinsics["cy"] - intrinsics["height"] / 2.0) / intrinsics["fy"] * focal_length_mm
+    # Principal-point offset (0 = centred).
+    cx_offset = (K["cx"] - cfg.width  / 2.0) / K["fx"] * focal_length_mm
+    cy_offset = (K["cy"] - cfg.height / 2.0) / K["fy"] * focal_length_mm
     camera.GetHorizontalApertureOffsetAttr().Set(cx_offset)
     camera.GetVerticalApertureOffsetAttr().Set(cy_offset)
 
-    # Near/far clipping planes (meters).
     camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.01, 100.0))
-
     return prim_path
 
 
-def set_viewport_camera(camera_path):
-    """Set the active viewport to render from the given camera prim."""
+def set_viewport_camera(camera_path: str) -> None:
+    """Switch the active viewport to render from the given camera prim."""
     from .viewport import get_viewport_utility
     viewport_utility = get_viewport_utility()
     if viewport_utility is None:
-        print("[camera] Warning: could not set viewport camera (omni.kit.viewport.utility unavailable)")
+        print("[camera] Warning: omni.kit.viewport.utility unavailable")
         return
     viewport = viewport_utility.get_active_viewport()
     if viewport is None:
@@ -154,7 +111,17 @@ def set_viewport_camera(camera_path):
     viewport.set_active_camera(camera_path)
 
 
-# ── Private helpers ──────────────────────────────────────────────────────────
+# ── Internal helpers ─────────────────────────────────────────────────────────
+def _check_intrinsics(K: dict) -> None:
+    missing = [k for k in ("fx", "fy", "cx", "cy") if K.get(k, 0.0) == 0.0]
+    if missing:
+        raise ValueError(
+            f"Camera intrinsics keys {missing} are zero. Fill "
+            f"cfg.camera.intrinsics from the factory calibration "
+            f"before running."
+        )
 
 
-
+def _camel(name: str) -> str:
+    """Convert ``foo_bar_baz`` → ``FooBarBaz`` for use as a prim path segment."""
+    return "".join(part.capitalize() for part in name.split("_"))

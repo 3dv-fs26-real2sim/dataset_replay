@@ -1,4 +1,4 @@
-"""Generate a Lula robot descriptor YAML for the FER arm from its URDF.
+"""Generate a Lula robot descriptor YAML for the panda arm from its URDF.
 
 This is a one-time utility. Run it if the URDF changes or you need to
 regenerate the descriptor file.
@@ -13,11 +13,11 @@ from pathlib import Path
 import yaml
 
 SCRIPT_DIR = Path(__file__).parent
-DEFAULT_URDF = SCRIPT_DIR / "../../pandaorca_description/urdf/fer.urdf"
-DEFAULT_OUTPUT = SCRIPT_DIR / "../../pandaorca_description/lula/fer_robot_descriptor.yaml"
+DEFAULT_URDF = SCRIPT_DIR / "../../assets/urdf/panda_arm.urdf"
+DEFAULT_OUTPUT = SCRIPT_DIR / "../../assets/lula/panda_arm_descriptor.yaml"
 
-# FER arm active joints (7-DOF, same kinematic structure as Franka Panda)
-FER_JOINTS = [f"fer_joint{i}" for i in range(1, 8)]
+# Panda arm active joints (7-DOF Franka FR3/Panda)
+PANDA_JOINTS = [f"panda_joint{i}" for i in range(1, 8)]
 
 # Limits taken from the Franka Panda descriptor shipped with Isaac Sim
 ACCELERATION_LIMITS = [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
@@ -30,8 +30,8 @@ DEFAULT_Q = [0.00, -1.3, 0.00, -2.87, 0.00, 2.00, 0.75]
 def generate_descriptor(urdf_path: Path, output_path: Path):
     descriptor = {
         "api_version": 1.0,
-        "cspace": FER_JOINTS,
-        "root_link": "base",
+        "cspace": PANDA_JOINTS,
+        "root_link": "panda_link0",
         "default_q": DEFAULT_Q,
         "acceleration_limits": ACCELERATION_LIMITS,
         "jerk_limits": JERK_LIMITS,
@@ -42,7 +42,7 @@ def generate_descriptor(urdf_path: Path, output_path: Path):
 
     with open(output_path, "w") as f:
         f.write(
-            "# Robot descriptor for the FER (Franka-like) 7-DOF arm.\n"
+            "# Robot descriptor for the 7-DOF Franka FR3/Panda arm.\n"
             "# Used by the Lula IK solver in Isaac Sim.\n"
             f"# Generated from URDF: {urdf_path}\n\n"
         )
@@ -50,7 +50,7 @@ def generate_descriptor(urdf_path: Path, output_path: Path):
 
     print(f"Wrote robot descriptor to {output_path}")
     print(f"  URDF: {urdf_path}")
-    print(f"  Active joints: {FER_JOINTS}")
+    print(f"  Active joints: {PANDA_JOINTS}")
 
 
 if __name__ == "__main__":

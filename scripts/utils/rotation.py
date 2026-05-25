@@ -6,7 +6,18 @@ Pure math — only numpy and scipy. No Isaac Sim dependencies.
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .constants import Q_TOOL_TO_URDF
+from .constants import Q_TOOL_TO_URDF, TOOL_QUAT_NEGATE_PATTERN
+
+_NEGATE_MASKS = {
+    "baseline":  (False, False, False),
+    "negx":      (True,  False, False),
+    "negy":      (False, True,  False),
+    "negz":      (False, False, True),
+    "negxy":     (True,  True,  False),
+    "negxz":     (True,  False, True),
+    "negyz":     (False, True,  True),
+    "conjugate": (True,  True,  True),
+}
 
 
 def rotation_matrix_to_wxyz(rot_matrix: np.ndarray) -> np.ndarray:
@@ -34,8 +45,33 @@ def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
 
 
 def tool_quat_to_urdf(q_tool_wxyz: np.ndarray) -> np.ndarray:
-    """Convert tool-convention quaternion (identity=down) to URDF convention."""
-    return quat_multiply(Q_TOOL_TO_URDF, q_tool_wxyz)
+    """Translate an H5-recorded wrist quaternion to URDF panda_link8 frame.
+
+    Applies the three independent conventions that differ between the H5
+    recording (Rokoko-LH sensor frame, tool-identity = hand-down) and the
+    URDF (RH panda_link8 frame, identity = Franka flange default):
+
+        1. Handedness  (LH → RH)        — negate x, z   (TOOL_QUAT_NEGATE_PATTERN="negxz")
+        2. Axis labels (their X ↔ our Z) — swap x, z
+        3. Tool identity (down → URDF)  — pre-multiply Q_TOOL_TO_URDF = Rx(180°)
+
+    See constants.py for the rationale on each step. The pattern knob is
+    operational at "negxz"; other values exist for sign-ambiguity sweeps.
+    """
+    if TOOL_QUAT_NEGATE_PATTERN not in _NEGATE_MASKS:
+        raise ValueError(
+            f"TOOL_QUAT_NEGATE_PATTERN={TOOL_QUAT_NEGATE_PATTERN!r}; "
+            f"expected one of {sorted(_NEGATE_MASKS)}"
+        )
+    q = np.asarray(q_tool_wxyz, dtype=float).copy()
+    # (1) Handedness flip — chirality fix for Rokoko-LH → URDF-RH.
+    for i, neg in enumerate(_NEGATE_MASKS[TOOL_QUAT_NEGATE_PATTERN], start=1):
+        if neg:
+            q[i] = -q[i]
+    # (2) Axis remap — Rokoko's X-axis is URDF's Z-axis.
+    q = np.array([q[0], q[3], q[2], q[1]])
+    # (3) Tool-identity flip — recorded "identity = hand down" → URDF flange.
+    return quat_multiply(Q_TOOL_TO_URDF, q)
 
 
 def detect_quaternion_order(arm_data: np.ndarray, label: str) -> np.ndarray:
