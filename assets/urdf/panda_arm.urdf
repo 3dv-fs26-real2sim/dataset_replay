@@ -140,4 +140,11 @@
     <parent link="panda_link7"/>
     <child link="panda_link8"/>
   </joint>
+  <!-- "wrist" offset used by teleoperation system -->
+  <link name="ee_target"/>
+  <joint name="ee_target_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.13 0 0.07"/>
+    <parent link="panda_link8"/>
+    <child link="ee_target"/>
+  </joint>
 </robot>

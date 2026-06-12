@@ -75,11 +75,9 @@ HAND_HOME_JOINT_VALUES = np.zeros(N_HAND_DOFS)
 
 
 # ── IK configuration ──────────────────────────────────────────────────────────
-EE_FRAME_NAME = "panda_link8"
+EE_FRAME_NAME = "ee_target"  # virtual TCP frame added to panda_arm.urdf (= link8+0.13,0,0.07)
 
-# Offset from panda_link8 to the recorded "EE wrist" reference point, in
-# panda_link8's local frame. IK aims panda_link8 at
-# ``target_pos - R_link8 @ EE_WRIST_OFFSET_IN_LINK8``.
+# The teleop "EE wrist" reference point, offset (0.13,0,0.07) from panda_link8.
 #
 # Value [0.13, 0, 0.07] is the *teleop EE-wrist* convention shared with
 # franka_teleop and the IsaacLab env cfg (teleop_manip_env_cfg.py:61).

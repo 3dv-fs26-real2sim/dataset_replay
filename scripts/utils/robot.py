@@ -10,7 +10,7 @@ from isaacsim.core.prims import SingleArticulation
 
 from .config import BaseSceneConfig
 from .constants import (
-    ARM_JOINT_NAMES, EE_FRAME_NAME, EE_WRIST_OFFSET_IN_LINK8,
+    ARM_JOINT_NAMES, EE_FRAME_NAME,
     HAND_HOME_JOINT_VALUES, HAND_JOINT_NAMES, ROBOT_PRIM_PATH,
     WRIST_HOME_POSITION, WRIST_HOME_ROTATION,
 )
@@ -44,15 +44,15 @@ def setup_robot(world: World, cfg: BaseSceneConfig) -> dict:
     ik_solver = create_ik_solver(cfg.urdf_path, cfg.lula_descriptor, "right")
 
     home_wrist_quat = rotation_matrix_to_wxyz(WRIST_HOME_ROTATION)
-    home_link8_pos  = WRIST_HOME_POSITION - WRIST_HOME_ROTATION @ EE_WRIST_OFFSET_IN_LINK8
+    home_ee_pos     = WRIST_HOME_POSITION 
 
     home_arm_joints, ok = solve_ik_for_pose(
-        ik_solver, EE_FRAME_NAME, home_link8_pos, home_wrist_quat,
+        ik_solver, EE_FRAME_NAME, home_ee_pos, home_wrist_quat,
     )
     if not ok or home_arm_joints is None:
         raise RuntimeError(
             f"IK failed for home wrist pose "
-            f"(link8_pos={home_link8_pos}, quat={home_wrist_quat}). "
+            f"(link8_pos={home_ee_pos}, quat={home_wrist_quat}). "
             f"Check the Lula descriptor at {cfg.lula_descriptor}."
         )
     print(f"[IK] Home arm joints (rad): {home_arm_joints}")
@@ -73,7 +73,7 @@ def setup_robot(world: World, cfg: BaseSceneConfig) -> dict:
         art, arm_idx, hand_idx,
         ik_solver, EE_FRAME_NAME,
         HAND_HOME_JOINT_VALUES, home_arm_joints,
-        ee_wrist_offset=EE_WRIST_OFFSET_IN_LINK8,
+        ee_wrist_offset=None,
     )
 
     return {

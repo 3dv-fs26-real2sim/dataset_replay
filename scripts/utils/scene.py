@@ -199,15 +199,13 @@ def _add_robot(stage: Usd.Stage, cfg: BaseSceneConfig) -> None:
     the visible base lands exactly at ``mount_xyz`` rather than ~0.5 m above
     the table.
     """
-    target_world = np.asarray(cfg.robot.mount_xyz, dtype=float)
-    internal     = np.asarray(cfg.robot.panda_link0_local_translate, dtype=float)
-    wrapper_translate = tuple((target_world - internal).tolist())
+    wrapper_translate = tuple(np.asarray(cfg.robot.mount_xyz, dtype=float).tolist())
 
     xform = UsdGeom.Xform.Define(stage, ROBOT_PRIM_PATH)
     prim = xform.GetPrim()
     prim.GetReferences().AddReference(
         assetPath=str(cfg.robot_asset_path),
-        primPath=Sdf.Path("/Root"),
+        primPath=Sdf.Path("/fer_orcahand_right_extended"),
     )
 
     if any(r != 0.0 for r in cfg.robot.mount_rpy):

@@ -91,11 +91,6 @@ class RobotMountConfig:
     """
     mount_xyz: tuple[float, float, float] = (-0.255, -0.35, 0.75)
     mount_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    panda_link0_local_translate: tuple[float, float, float] = (
-        -0.007610592991113663,
-        -0.00026992621133103967,
-        -0.4760153889656067,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +123,7 @@ class BaseSceneConfig:
     robot:   RobotMountConfig = field(default_factory=RobotMountConfig)
     camera:  BaseCameraConfig = field(default_factory=BaseCameraConfig)
 
-    robot_asset_path: Path = ASSETS / "orcav1b_franka_vmnt_v10_flattened.usd"
+    robot_asset_path: Path = ASSETS / "pandaorca_right.usd"
     urdf_path:        Path = ASSETS / "urdf" / "panda_arm.urdf"
     lula_descriptor:  Path = ASSETS / "lula" / "panda_arm_descriptor.yaml"
 
