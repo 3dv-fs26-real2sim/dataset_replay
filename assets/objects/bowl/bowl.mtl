@@ -1,0 +1,7 @@
+# Purple bowl material (solid RGB 50 50 90 via bowl.png UV texture)
+newmtl material_0
+Ka 1 1 1
+Kd 1 1 1
+Ks 1 1 1
+Ns 1000
+map_Kd bowl.png

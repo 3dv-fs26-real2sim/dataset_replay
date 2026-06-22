@@ -41,6 +41,7 @@ from .config import (
     ASSETS,
     BaseCameraConfig,
     BaseSceneConfig,
+    LightingConfig,
     RobotMountConfig,
 )
 
@@ -191,6 +192,9 @@ class MapleSceneConfig(BaseSceneConfig):
     camera:   OakDCameraConfig  = field(default_factory=OakDCameraConfig)
     robot:    RobotMountConfig  = field(
         default_factory=lambda: RobotMountConfig(mount_xyz=(-0.255, -0.35, 0.75)))
+    # Walls occlude the lights, so scale the studio-fill rig up to match egoverse.
+    lighting: LightingConfig    = field(
+        default_factory=lambda: LightingConfig(intensity_scale=1.3))
 
     def has_walls(self)    -> bool: return True
     def has_apriltag(self) -> bool: return True

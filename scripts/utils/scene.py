@@ -43,7 +43,7 @@ def build_scene(cfg: BaseSceneConfig, *, robot_collision: bool = False) -> Usd.S
     _define_world(stage)
     _add_physics_scene(stage)
     _add_ground_plane(stage)
-    _add_lighting(stage)
+    _add_lighting(stage, cfg)
     _add_tables(stage, cfg)
 
     wall_paths: tuple[str, ...] = ()
@@ -101,11 +101,27 @@ def _add_ground_plane(stage: Usd.Stage) -> None:
     UsdPhysics.CollisionAPI.Apply(plane.GetPrim())
 
 
-def _add_lighting(stage: Usd.Stage) -> None:
+def _add_lighting(stage: Usd.Stage, cfg: BaseSceneConfig) -> None:
+    """Soft 'studio-fill' lighting: an ambient dome + two wide-angle side keys.
+
+    Replaces the old single hard ``DistantLight`` (which left harsh shadows).
+    Parameters come from ``cfg.lighting`` so each rig can tune the rig — Maple
+    scales the intensities up for its walls. The large key ``angle`` (angular
+    size) softens the cast shadows; the dome fills them.
+    """
     UsdGeom.Xform.Define(stage, "/Environment")
-    light = UsdLux.DistantLight.Define(stage, "/Environment/defaultLight")
-    light.CreateAngleAttr(1.0)
-    light.CreateIntensityAttr(3000.0)
+    lc = cfg.lighting
+    s = lc.intensity_scale
+
+    dome = UsdLux.DomeLight.Define(stage, "/Environment/domeLight")
+    dome.CreateIntensityAttr(lc.dome_intensity * s)
+
+    for i, az in enumerate(lc.key_azimuths_deg):
+        key = UsdLux.DistantLight.Define(stage, f"/Environment/keyLight_{i}")
+        key.CreateIntensityAttr(lc.key_intensity * s)
+        key.CreateAngleAttr(lc.key_angle_deg)
+        UsdGeom.XformCommonAPI(key.GetPrim()).SetRotate(
+            Gf.Vec3f(lc.key_elev_deg, 0.0, float(az)))
 
 
 def _add_tables(stage: Usd.Stage, cfg: BaseSceneConfig) -> None:
@@ -139,7 +155,8 @@ def _add_tables(stage: Usd.Stage, cfg: BaseSceneConfig) -> None:
         )
         if cfg.table.texture_path.exists():
             bind_image_texture(stage, prim_path, cfg.table.texture_path,
-                               material_name="wood_table_mat")
+                               material_name="wood_table_mat",
+                               rotate_deg=cfg.table.texture_rotate_deg)
         UsdPhysics.CollisionAPI.Apply(mesh.GetPrim())
         col = UsdPhysics.MeshCollisionAPI.Apply(mesh.GetPrim())
         col.CreateApproximationAttr("convexHull")

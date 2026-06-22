@@ -48,6 +48,7 @@ class TableConfig:
     centre_xy:      tuple[float, float] = (0.0, 0.0)    # of the combined surface
     texture_path:   Path = ASSETS / "textures" / "wood.jpg"
     uv_repeat:      tuple[float, float] = (2.0, 3.0)    # texture tiles per surface
+    texture_rotate_deg: float = 90.0                    # rotate the wood grain in UV space
 
     # ------------------------------------------------------------- derived
     @property
@@ -111,6 +112,24 @@ class BaseCameraConfig:
 
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
+class LightingConfig:
+    """Soft 'studio-fill' rig: an ambient dome + two wide-angle side keys.
+
+    The large ``key_angle_deg`` (the lights' angular size) is what softens the
+    cast shadows; the dome fills the rest. ``intensity_scale`` is a per-dataset
+    multiplier — Maple's walls occlude the lights, so it scales up to match the
+    open Egoverse desk (see ``config_maple``).
+    """
+    dome_intensity:   float = 350.0
+    key_intensity:    float = 700.0
+    key_angle_deg:    float = 20.0                       # angular size -> shadow softness
+    key_elev_deg:     float = -25.0                      # tilt about X (down from horizontal)
+    key_azimuths_deg: tuple[float, ...] = (35.0, -35.0)  # one DistantLight per azimuth (about Z)
+    intensity_scale:  float = 1.0                        # per-dataset multiplier
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
 class BaseSceneConfig:
     """Top-level scene config.
 
@@ -118,10 +137,11 @@ class BaseSceneConfig:
     `has_walls() / has_apriltag()` switches, and override `viewport_size()`
     if the rig wants something other than 16:9.
     """
-    dataset: str = ""                                    # "maple" | "egoverse"
-    table:   TableConfig      = field(default_factory=TableConfig)
-    robot:   RobotMountConfig = field(default_factory=RobotMountConfig)
-    camera:  BaseCameraConfig = field(default_factory=BaseCameraConfig)
+    dataset:  str = ""                                   # "maple" | "egoverse"
+    table:    TableConfig      = field(default_factory=TableConfig)
+    robot:    RobotMountConfig = field(default_factory=RobotMountConfig)
+    camera:   BaseCameraConfig = field(default_factory=BaseCameraConfig)
+    lighting: LightingConfig   = field(default_factory=LightingConfig)
 
     robot_asset_path: Path = ASSETS / "pandaorca_right.usd"
     urdf_path:        Path = ASSETS / "urdf" / "panda_arm.urdf"

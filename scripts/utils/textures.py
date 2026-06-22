@@ -24,6 +24,7 @@ def bind_image_texture(
     *,
     material_root: str = "/World/Looks",
     material_name: str | None = None,
+    rotate_deg: float = 0.0,
 ) -> str:
     """Bind a ``UsdPreviewSurface`` material with a file-backed diffuse texture
     to the mesh at ``mesh_prim_path``. Idempotent: re-uses an existing material
@@ -31,7 +32,9 @@ def bind_image_texture(
 
     UVs must already be authored on the mesh as a ``primvars:st`` Float2Array
     (use :func:`set_box_planar_uvs` or :func:`set_quad_unit_uvs` before calling
-    this). Returns the material prim path.
+    this). ``rotate_deg`` (nonzero) inserts a ``UsdTransform2d`` to rotate the
+    texture in UV space — used to fix the table wood-grain direction. Returns
+    the material prim path.
     """
     mat_name = material_name or Path(texture_path).stem + "_mat"
     mat_path = Sdf.Path(f"{material_root}/{mat_name}")
@@ -52,11 +55,20 @@ def bind_image_texture(
     uv_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
     uv_out = uv_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
 
+    # ── Optional UV rotation (e.g. to fix the wood-grain direction) ─────────
+    st_source = uv_out
+    if rotate_deg:
+        st_xform = UsdShade.Shader.Define(stage, mat_path.AppendChild("stRotate"))
+        st_xform.CreateIdAttr("UsdTransform2d")
+        st_xform.CreateInput("in", Sdf.ValueTypeNames.Float2).ConnectToSource(uv_out)
+        st_xform.CreateInput("rotation", Sdf.ValueTypeNames.Float).Set(float(rotate_deg))
+        st_source = st_xform.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
     # ── Diffuse texture ────────────────────────────────────────────────────
     tex = UsdShade.Shader.Define(stage, mat_path.AppendChild("diffuseTex"))
     tex.CreateIdAttr("UsdUVTexture")
     tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(str(texture_path))
-    tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(uv_out)
+    tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_source)
     # Repeat-wrap so UVs > 1.0 tile the texture.
     tex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
     tex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")

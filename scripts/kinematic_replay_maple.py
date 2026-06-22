@@ -41,7 +41,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.app import add_common_args, create_app
-from utils.config import PROJECT_ROOT
+from utils.config import ASSETS
 from utils.config_maple import MapleSceneConfig
 from utils.h5_loader import H5Reader, SCHEMA
 
@@ -60,7 +60,7 @@ parser.add_argument("--h5-camera", "--camera-name", dest="h5_camera",
                     help=f"Image dataset key in H5 (default: "
                          f"{SCHEMA[DATASET].default_camera})")
 parser.add_argument("--object", type=str, default=None,
-                    help="Object name to spawn (folder under objects/); "
+                    help="Object name to spawn (folder under assets/objects/); "
                          "pass empty string to disable (default: none)")
 parser.add_argument("--object-traj", type=Path, default=None,
                     help="(N,4,4) trajectory .npz; frame set by "
@@ -72,6 +72,11 @@ parser.add_argument("--object-traj-frame", choices=("camera", "world"),
                          "uses the NPZ verbatim.")
 parser.add_argument("--object-scale", type=float, default=0.1,
                     help="Object scale (default: 0.1)")
+parser.add_argument("--props", type=Path, default=None,
+                    help="all_object_world_poses.npz: spawn box/carpet/heater as STATIC "
+                         "objects at their world poses (keys '<session>__<name>').")
+parser.add_argument("--props-session", type=str, default=None,
+                    help="Session prefix for --props keys (default: H5 stem).")
 parser.add_argument("--no-camera", action="store_true",
                     help="Skip OakD camera setup")
 parser.add_argument("--no-calibrate", action="store_true",
@@ -179,23 +184,78 @@ if not args.no_camera:
         print(f"[kinematic_replay/maple] Skipping camera setup: {e}")
 
 
+# ── Collision disabling (kinematic replay = purely visual; no contacts) ──────
+def _disable_collisions_under(stage, root_path: str) -> None:
+    """Disable every collider under ``root_path`` (referenced USDs bake in
+    CollisionAPI). Kinematic replay only teleports poses — no physics contact."""
+    from pxr import Usd, UsdPhysics, Sdf
+    root = stage.GetPrimAtPath(root_path)
+    for prim in Usd.PrimRange(root):
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            attr = prim.GetAttribute("physics:collisionEnabled")
+            if not attr:
+                attr = prim.CreateAttribute("physics:collisionEnabled", Sdf.ValueTypeNames.Bool)
+            attr.Set(False)
+
+
 # ── Spawn object (independent of --h5 so the scene can be inspected) ──────────
 # Placed at the table centre, lifted slightly above the top surface. When an
 # --object-traj is given (H5 path below) the per-frame poses override this.
 object_prim_path: str | None = None
 object_traj: np.ndarray | None = None
 if args.object is not None:
-    objects_dir = PROJECT_ROOT / "objects"
-    object_prim_path = spawn_object(
-        stage, args.object, objects_dir,
-        position=(cfg.table.centre_xy[0], cfg.table.centre_xy[1],
-                  cfg.table.top_z + 0.05),
-        scale=args.object_scale,
-        kinematic=True, collision=False,
-    )
-    print(f"[kinematic_replay/maple] spawned '{args.object}' at table centre "
-          f"({cfg.table.centre_xy[0]:.3f}, {cfg.table.centre_xy[1]:.3f}, "
-          f"{cfg.table.top_z + 0.05:.3f})")
+    objects_dir = ASSETS / "objects"
+    # Prefer the validated VHACD USD (the same asset the training env renders):
+    # the large pan .obj imports unreliably via spawn_object and renders blank,
+    # so reference the .usd under a wrapper Xform + scale and pose it per frame.
+    usd_collider = objects_dir / args.object / f"{args.object}_vhacd.usd"
+    if usd_collider.exists():
+        from pxr import UsdGeom, Gf                              # noqa: E402
+        # Scale lives on the INNER /visual prim; the wrapper carries only the
+        # per-frame pose (set_object_world_pose). Putting scale on the wrapper
+        # corrupts XformCommonAPI's translate op-order → the position gets
+        # scaled to ~origin and the object shrinks. (Mirrors the props split.)
+        object_prim_path = f"/World/Objects/{args.object}"
+        UsdGeom.Xform.Define(stage, object_prim_path)
+        ref = UsdGeom.Xform.Define(stage, f"{object_prim_path}/visual")
+        ref.GetPrim().GetReferences().AddReference(str(usd_collider.resolve()))
+        UsdGeom.XformCommonAPI(ref.GetPrim()).SetScale(
+            Gf.Vec3f(args.object_scale, args.object_scale, args.object_scale))
+        # _disable_collisions_under(stage, object_prim_path)  # TEST: temporarily off
+        print(f"[kinematic_replay/maple] spawned '{args.object}' from "
+              f"{usd_collider.name} (scale {args.object_scale})")
+    else:
+        object_prim_path = spawn_object(
+            stage, args.object, objects_dir,
+            position=(cfg.table.centre_xy[0], cfg.table.centre_xy[1],
+                      cfg.table.top_z + 0.05),
+            scale=args.object_scale, kinematic=True, collision=False,
+        )
+        print(f"[kinematic_replay/maple] spawned '{args.object}' (obj) at table centre")
+
+
+# ── Static scene props (box / carpet / heater) at their measured world poses ──
+# box/carpet/heater are USD-only (no .obj), so reference the .usd under a clean
+# wrapper Xform (mirroring spawn_object's wrapper/visual split) and pose the
+# wrapper. Purely visual/static — no trajectory, set once.
+if args.props is not None:
+    from pxr import UsdGeom                                    # noqa: E402
+    props_session = args.props_session or (args.h5.stem if args.h5 is not None else None)
+    d = np.load(args.props, allow_pickle=True)
+    for name in ("box", "carpet", "heater"):
+        key = f"{props_session}__{name}"
+        if key not in d.files:
+            print(f"[kinematic_replay/maple] prop {key!r} not in {args.props.name} — skipping")
+            continue
+        T_world = np.asarray(d[key], dtype=float).reshape(4, 4)
+        usd_path = ASSETS / "objects" / name / f"{name}.usd"
+        wrapper = f"/World/Props/{name}"
+        UsdGeom.Xform.Define(stage, wrapper)
+        ref = UsdGeom.Xform.Define(stage, f"{wrapper}/visual")
+        ref.GetPrim().GetReferences().AddReference(str(usd_path.resolve()))
+        set_object_world_pose(stage, wrapper, T_world)   # full pose + orientation
+        # _disable_collisions_under(stage, wrapper)  # TEST: temporarily off
+        print(f"[kinematic_replay/maple] static prop {name:7s} at world {np.round(T_world[:3,3],3)}")
 
 
 # ── No --h5 → just hold home pose ────────────────────────────────────────────

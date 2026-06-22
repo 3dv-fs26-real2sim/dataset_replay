@@ -44,7 +44,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from utils.app import add_common_args, create_app
-from utils.config import PROJECT_ROOT
+from utils.config import ASSETS
 from utils.config_egoverse import EgoverseSceneConfig
 from utils.h5_loader import H5Reader, SCHEMA
 
@@ -67,7 +67,7 @@ parser.add_argument("--use-actions", action="store_true",
                          "actions_hand instead of observations/qpos_arm / "
                          "observations/qpos_hand.")
 parser.add_argument("--object", type=str, default=None,
-                    help="Object name to spawn (folder under objects/); "
+                    help="Object name to spawn (folder under assets/objects/); "
                          "pass empty string to disable (default: none)")
 parser.add_argument("--object-traj", type=Path, default=None,
                     help="(N,4,4) trajectory .npz")
@@ -217,7 +217,7 @@ if not args.no_camera:
 object_prim_path: str | None = None
 object_traj: np.ndarray | None = None
 if args.object is not None:
-    objects_dir = PROJECT_ROOT / "objects"
+    objects_dir = ASSETS / "objects"
     object_prim_path = spawn_object(
         stage, args.object, objects_dir,
         position=(cfg.table.centre_xy[0], cfg.table.centre_xy[1],
