@@ -1,4 +1,0 @@
-h5py
-imageio[ffmpeg]
-ipykernel
-pupil-apriltags

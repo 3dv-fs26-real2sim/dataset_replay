@@ -1,0 +1,46 @@
+# Conda environment for dataset_replay (kinematic replay + residual-RL training).
+#
+# Recreates the verified `3dv` stack: IsaacSim 5.1.0 + IsaacLab 2.3.x +
+# rsl-rl-lib 3.1.2 on Python 3.11 / Torch 2.7 (CUDA 12.8). Pins match the
+# environment the lab/ training env was tested against.
+#
+#   conda env create -f environment.yml      # creates env "dataset_replay"
+#   conda activate dataset_replay
+#   # then install IsaacLab from source (NOT on PyPI — see the note below):
+#   git clone --depth 1 --branch v2.3.0 https://github.com/isaac-sim/IsaacLab.git ../IsaacLab
+#   pip install -e ../IsaacLab/source/isaaclab
+#   pip install -e ../IsaacLab/source/isaaclab_assets
+#   pip install -e "../IsaacLab/source/isaaclab_rl[rsl-rl]"
+#   pip install -e ../IsaacLab/source/isaaclab_tasks
+#
+# First IsaacSim launch needs OMNI_KIT_ACCEPT_EULA=YES (cached afterwards).
+#
+# If you already have the `3dv` env, you do NOT need to recreate it — lab/
+# runs in it as-is. This file documents/reproduces that env on a new machine.
+
+name: dataset_replay
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # IsaacSim wheels live on NVIDIA's index; Torch CUDA wheels on PyTorch's.
+      - --extra-index-url https://pypi.nvidia.com
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - isaacsim[all,extscache]==5.1.0
+      - torch==2.7.0
+      - torchvision==0.22.0
+      - rsl-rl-lib==3.1.2
+      # numpy <2 for IsaacSim/USD compatibility.
+      - numpy==1.26.0
+      - scipy>=1.15
+      - gymnasium==1.2.1
+      # Replay / capture / calibration extras (kinematic_replay_*.py, utils/).
+      - h5py
+      - imageio[ffmpeg]
+      - pupil-apriltags
+      - ipykernel
+      # NOTE: IsaacLab (isaaclab, isaaclab_rl, isaaclab_tasks, isaaclab_assets)
+      # is installed from source — see the header comment. Not pip-installable
+      # from PyPI for the sub-packages.

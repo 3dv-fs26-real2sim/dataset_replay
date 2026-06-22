@@ -2,3 +2,5 @@
 *.mp4
 *.npz
 __pycache__/
+logs/
+outputs/

@@ -57,29 +57,79 @@ values, and the geometry sketches in each.
 
 ## Setup
 
-Create a conda environment and install the dependencies. I prefer installing
-Isaac Sim and all dependencies into a single conda env. If you have a
-different installation method for Isaac Sim you would need to link it
-somehow.
+Everything runs in one conda env (`3dv`): IsaacSim 5.1.0 + IsaacLab 2.3.x +
+rsl-rl 3.1.2 on Python 3.11 / Torch 2.7 (CUDA 12.8). The pinned spec lives in
+[`environment.yml`](environment.yml) (it replaces the old `requirements.txt`).
 
 ```bash
-conda create -n 3dv python=3.11
-conda activate 3dv
+# 1. Create the env (IsaacSim + Torch + rsl-rl + replay/capture extras).
+conda env create -f environment.yml      # creates env "dataset_replay"
+conda activate dataset_replay            # (or reuse an existing "3dv" env)
 
-# Isaac Sim (https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/install_python.html)
-pip install isaacsim[all,extscache]==5.1.0 --extra-index-url https://pypi.nvidia.com
-
-pip install -r requirements.txt
+# 2. Install IsaacLab from source (sub-packages are not on PyPI).
+git clone --depth 1 --branch v2.3.0 https://github.com/isaac-sim/IsaacLab.git ../IsaacLab
+pip install -e ../IsaacLab/source/isaaclab
+pip install -e ../IsaacLab/source/isaaclab_assets
+pip install -e "../IsaacLab/source/isaaclab_rl[rsl-rl]"
+pip install -e ../IsaacLab/source/isaaclab_tasks
 ```
+
+IsaacLab is only needed for the **residual-RL training env** under
+[`lab/`](lab/) — kinematic replay (the `scripts/` entry points) needs only
+IsaacSim. The first IsaacSim launch needs `OMNI_KIT_ACCEPT_EULA=YES` (cached
+afterwards).
 
 Data goes under `data/<dataset>/`:
 
 - H5 recordings → `data/<dataset>/h5/`
 - object pose trajectories → `data/<dataset>/pose/`
-- SAM table masks (egoverse only) → `data/egoverse/desk/<h5_stem>_desk.npz`
+- SAM table masks (egoverse only for calibration) → `data/egoverse/desk/<h5_stem>_desk.npz`
+- residual-RL demos → `data/<dataset>/demos/` (built by `lab/scripts/make_demo.py`)
 
-Object meshes live under `objects/<name>/<name>.obj` (e.g. `objects/duck/`,
-`objects/pan/`).
+Object meshes live under `assets/objects/<name>/<name>.obj` (kinematic replay)
+and `assets/objects/<name>/<name>_vhacd.usd` (RL grasp colliders).
+
+---
+
+## Residual-RL training (`lab/`)
+
+Beyond kinematic replay, [`lab/`](lab/) trains a **residual policy** that makes
+the recorded grasp robust under physics: a deterministic per-frame baseline
+plays the demo's joint targets, and a PPO policy learns a small correction on
+top.
+
+```
+joint_target[t] = recorded_qpos[t]  +  residual_scale * policy(obs)
+```
+
+The baseline arm joints (`arm_qpos`) come from the **same Lula IK** the replay
+scripts use (`utils/ik.py`), so replay and training share one kinematic
+convention. Two gym tasks are registered, one per rig — `egoverse` (duck) and
+`maple` (pan + optional static props). See [`lab/README.md`](lab/README.md) for
+the full design; quick start:
+
+```bash
+conda activate dataset_replay
+
+# EgoVerse duck-grasp
+python lab/train.py --task egoverse \
+    --demo data/egoverse/demos/egoverse_duck_104715.npz --num_envs 64 --headless
+
+# MAPLE pan (with static props)
+python lab/train.py --task maple \
+    --demo data/maple/demos/maple_pan_143954.npz \
+    --maple-props data/maple/demos/maple_props_143954.npz --num_envs 64 --headless
+
+# Build a new demo from a raw H5 (dataset_replay-style Lula IK retarget)
+python lab/scripts/make_demo.py --dataset egoverse \
+    --h5 data/egoverse/h5/20250804_104715.h5 --object duck \
+    --out data/egoverse/demos/egoverse_duck_104715.npz
+
+# Simulation-rich rollout capture (multi-view render + per-pad contact force + montage)
+python lab/rich/run_rich.py --task egoverse \
+    --demo data/egoverse/demos/egoverse_duck_104715.npz \
+    --checkpoint logs/rsl_rl/teleop_residual/<run>/model_<n>.pt --headless
+```
 
 ---
 
@@ -165,7 +215,7 @@ The loop runs `min(n_h5_frames, n_object_frames)` frames.
 
 ### Objects and trajectory frames
 
-Objects are spawned from `objects/<name>/<name>.obj` in **kinematic,
+Objects are spawned from `assets/objects/<name>/<name>.obj` in **kinematic,
 no-collision** mode (`utils/object.spawn_object`). An object can be spawned
 without an `--h5` (handy for eyeballing placement); when a trajectory is
 supplied the per-frame poses override the static placement.
@@ -212,7 +262,7 @@ python scripts/kinematic_replay_egoverse.py --h5 data/egoverse/h5/20250804_10471
 python scripts/kinematic_replay_egoverse.py \
     --h5 data/egoverse/h5/20250804_104715.h5 \
     --object duck \
-    --object-traj data/egoverse/pose/20250804_104715_duck_vdahand.npz
+    --object-traj data/egoverse/pose/20250804_104715_duck.npz
 
 # Recorded overlay (headless).
 python scripts/kinematic_replay_egoverse.py --headless \
@@ -229,9 +279,6 @@ python scripts/kinematic_replay_maple.py
 # Full replay; AprilTag-PnP refines T_world_cam at startup by scanning the
 # H5 video (~5 s; full scan).
 python scripts/kinematic_replay_maple.py --h5 data/maple/h5/20250922_143954.h5
-
-# Skip the startup scan, use the configured nominal OakD lookat pose.
-python scripts/kinematic_replay_maple.py --h5 data/maple/h5/20250922_143954.h5 --no-calibrate
 
 # ── Utilities ───────────────────────────────────────────────────────────────
 # Extract H5 camera video to MP4 (no GPU needed). FPS picked from camera
@@ -341,12 +388,4 @@ data/
     ├── pose/
     ├── desk/
     └── video/
-```
-
-Object meshes (rig-independent):
-
-```text
-objects/
-├── duck/
-└── pan/
 ```
